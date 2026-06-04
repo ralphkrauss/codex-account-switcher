@@ -96,8 +96,6 @@ jobs:
           npm init -y | Out-Null
           npm install (Join-Path $env:GITHUB_WORKSPACE $packageFile) | Out-Null
           $env:CODEX_HOME = Join-Path $tempDir "codex-home"
-          .
-ode_modules\.bin\cx.cmd --help
-          .
-ode_modules\.bin\cx.cmd doctor
+          ./node_modules/.bin/cx.cmd --help
+          ./node_modules/.bin/cx.cmd doctor
           Pop-Location
