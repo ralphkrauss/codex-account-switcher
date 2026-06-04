@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1-beta.0 - 2026-06-04
+
+### Changed
+
+- Test prerelease for npm Trusted Publishing from GitHub Actions.
+
 ## 0.1.0 - 2026-06-04
 
 ### Added
