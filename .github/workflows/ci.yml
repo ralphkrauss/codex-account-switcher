@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify on ${{ matrix.os }} / Node ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node-version: ['22', '24']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify
+        run: pnpm verify
+
+      - name: Install packed tarball smoke test
+        run: |
+          set -euo pipefail
+          package_file="$(npm pack --silent | tail -n 1)"
+          temp_dir="$(mktemp -d)"
+          cd "$temp_dir"
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$package_file" >/dev/null
+          CODEX_HOME="$temp_dir/codex-home" ./node_modules/.bin/cx --help
+          CODEX_HOME="$temp_dir/codex-home" ./node_modules/.bin/cx doctor
+
+  windows-smoke:
+    name: Windows Smoke on Node ${{ matrix.node-version }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22', '24']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Tests
+        run: pnpm test
+
+      - name: Install packed tarball smoke test
+        shell: pwsh
+        run: |
+          $packageFile = npm pack --silent | Select-Object -Last 1
+          $tempDir = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString())
+          New-Item -ItemType Directory -Path $tempDir | Out-Null
+          Push-Location $tempDir
+          npm init -y | Out-Null
+          npm install (Join-Path $env:GITHUB_WORKSPACE $packageFile) | Out-Null
+          $env:CODEX_HOME = Join-Path $tempDir "codex-home"
+          .
+ode_modules\.bin\cx.cmd --help
+          .
+ode_modules\.bin\cx.cmd doctor
+          Pop-Location

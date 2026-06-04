@@ -1,0 +1,10 @@
+dist/
+node_modules/
+coverage/
+*.log
+*.tgz
+.env
+*.env
+secrets.env
+mcp-secrets.env
+.DS_Store

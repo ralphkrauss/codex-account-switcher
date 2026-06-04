@@ -1,0 +1,101 @@
+name: Publish npm
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-npm-${{ github.ref_name }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check release version
+        run: node scripts/check-release-version.mjs
+
+      - name: Verify
+        run: pnpm verify
+
+      - name: Resolve npm dist-tag
+        id: publish-tag
+        run: node scripts/resolve-publish-tag.mjs >> "$GITHUB_OUTPUT"
+
+      - name: Read package metadata
+        id: package
+        run: |
+          node --input-type=module <<'NODE' >> "$GITHUB_OUTPUT"
+          import { readFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          console.log(`name=${pkg.name}`);
+          console.log(`version=${pkg.version}`);
+          console.log(`prerelease=${pkg.version.includes('-') ? 'true' : 'false'}`);
+          NODE
+
+      - name: Check npm version
+        id: npm
+        run: |
+          if npm view "${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.npm.outputs.published != 'true'
+        run: npm publish --access public --provenance --tag "${{ steps.publish-tag.outputs.tag }}"
+
+      - name: Already published
+        if: steps.npm.outputs.published == 'true'
+        run: echo "${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }} is already published; skipping ${{ steps.publish-tag.outputs.tag }} publish."
+
+      - name: Extract GitHub release notes
+        if: github.ref_type == 'tag'
+        run: node scripts/extract-changelog-release-notes.mjs "${{ steps.package.outputs.version }}" > release-notes.md
+
+      - name: Create or update GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_IS_PRERELEASE: ${{ steps.package.outputs.prerelease }}
+          RELEASE_TAG: v${{ steps.package.outputs.version }}
+          RELEASE_TITLE: v${{ steps.package.outputs.version }}
+        run: |
+          release_args=(--title "$RELEASE_TITLE" --notes-file release-notes.md --verify-tag)
+          if [ "$RELEASE_IS_PRERELEASE" = "true" ]; then
+            release_args+=(--prerelease)
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" "${release_args[@]}"
+          else
+            gh release create "$RELEASE_TAG" "${release_args[@]}"
+          fi

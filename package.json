@@ -1,0 +1,69 @@
+{
+  "name": "@ralphkrauss/codex-account-switcher",
+  "version": "0.1.0",
+  "description": "Safe multi-account auth.json switcher for the native Codex CLI.",
+  "author": "Ralph Krauss <ralph@krauss.be>",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "cx": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "node scripts/clean-dist.mjs && tsc",
+    "test": "node --test dist/__tests__/*.test.js",
+    "audit:prod": "pnpm audit --prod",
+    "verify": "pnpm build && pnpm test && node scripts/check-publish-ready.mjs && node scripts/resolve-publish-tag.mjs >/dev/null && pnpm audit --prod && npm pack --dry-run",
+    "prepack": "pnpm build",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "!dist/__tests__/",
+    "!src/__tests__/",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "PUBLISHING.md",
+    "LICENSE.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ralphkrauss/codex-account-switcher.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ralphkrauss/codex-account-switcher/issues"
+  },
+  "homepage": "https://github.com/ralphkrauss/codex-account-switcher#readme",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "codex-cli",
+    "account-switcher",
+    "auth",
+    "cli",
+    "typescript",
+    "nodejs"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.18",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "pnpm@10.30.3"
+}
