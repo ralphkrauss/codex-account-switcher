@@ -36,6 +36,10 @@ async function writeFakeCodex(path: string): Promise<void> {
   await chmod(path, 0o755);
 }
 
+async function readNormalized(path: string): Promise<string> {
+  return (await readFile(path, 'utf8')).replaceAll('\r\n', '\n');
+}
+
 test('cx --help prints usage', async (t) => {
   const home = await makeHome(t);
   const result = runCli(['--help'], { ...process.env, CODEX_HOME: home });
@@ -108,7 +112,7 @@ test('backward cx <account> switches then launches codex with remaining args', a
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /→ codex on 'work'/);
-  assert.equal(await readFile(argsFile, 'utf8'), 'exec\nhello\n');
+  assert.equal(await readNormalized(argsFile), 'exec\nhello\n');
   assert.match(await readFile(join(home, 'auth.json'), 'utf8'), /work-account/);
   assert.equal((await readFile(join(home, '.current-account'), 'utf8')).trim(), 'work');
 });
@@ -129,5 +133,5 @@ test('cx run -- uses the current auth and passes codex args after the separator'
     PATH: [bin, process.env.PATH ?? ''].join(delimiter),
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(await readFile(argsFile, 'utf8'), 'exec\nprompt\n');
+  assert.equal(await readNormalized(argsFile), 'exec\nprompt\n');
 });
