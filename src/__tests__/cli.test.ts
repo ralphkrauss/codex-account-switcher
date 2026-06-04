@@ -135,3 +135,30 @@ test('cx run -- uses the current auth and passes codex args after the separator'
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readNormalized(argsFile), 'exec\nprompt\n');
 });
+
+test('cx login forwards Codex login flags such as --device-auth', async (t) => {
+  const home = await makeHome(t);
+  const bin = join(home, 'bin');
+  const argsFile = join(home, 'codex-login-args.txt');
+  const fakeCodex = join(bin, process.platform === 'win32' ? 'codex.cmd' : 'codex');
+  await mkdir(bin, { recursive: true });
+
+  const loginJson = JSON.stringify({ label: 'device-login', filler: 'x'.repeat(180) });
+  const fakeCodexScript = process.platform === 'win32'
+    ? `@echo off\r\n(for %%A in (%*) do echo %%~A) > "%CODEX_ARGS_FILE%"\r\nif "%1"=="login" (\r\n  > "%CODEX_HOME%\\auth.json" echo ${loginJson}\r\n  exit /b 0\r\n)\r\nexit /b 42\r\n`
+    : `#!/bin/sh\nset -eu\nprintf '%s\\n' "${'$'}@" > "${'$'}CODEX_ARGS_FILE"\nif [ "${'$'}1" = "login" ]; then\n  printf '%s\\n' '${loginJson}' > "${'$'}CODEX_HOME/auth.json"\n  exit 0\nfi\nexit 42\n`;
+  await writeFile(fakeCodex, fakeCodexScript);
+  await chmod(fakeCodex, 0o755);
+
+  const result = runCli(['login', 'personal', '--device-auth'], {
+    ...process.env,
+    CODEX_HOME: home,
+    CODEX_ARGS_FILE: argsFile,
+    PATH: [bin, process.env.PATH ?? ''].join(delimiter),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await readNormalized(argsFile), 'login\n--device-auth\n');
+  assert.match(await readFile(join(home, 'accounts', 'personal.json'), 'utf8'), /device-login/);
+  assert.equal((await readFile(join(home, '.current-account'), 'utf8')).trim(), 'personal');
+});

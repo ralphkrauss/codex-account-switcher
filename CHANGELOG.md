@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1 - 2026-06-04
+
+### Added
+
+- `cx login <name>` now forwards Codex login arguments such as `--device-auth` for headless/remote authentication.
+
+### Changed
+
+- Documented device-auth and separator-based login examples.
+
 ## 0.1.1-beta.0 - 2026-06-04
 
 ### Changed

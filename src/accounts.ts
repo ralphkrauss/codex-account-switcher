@@ -47,6 +47,10 @@ export interface SpawnCodexOptions {
   readonly cwd?: string;
 }
 
+export interface LoginAccountOptions extends ForceOptions, SpawnCodexOptions {
+  readonly loginArgs?: readonly string[];
+}
+
 export interface AccountEntry {
   readonly name: string;
   readonly file: string;
@@ -492,7 +496,7 @@ export async function runCodex(
 
 export async function loginAccount(
   name: string,
-  options: ForceOptions & SpawnCodexOptions = {},
+  options: LoginAccountOptions = {},
 ): Promise<WritebackResult> {
   const paths = options.paths ?? getCodexPaths(options.env ?? process.env);
   const safeName = validateAccountName(name);
@@ -505,7 +509,7 @@ export async function loginAccount(
   const writeback = await writebackCurrentAccount({ paths });
   const loginExitCode = await runCodex([], {
     ...options,
-    args: ['login'],
+    args: ['login', ...(options.loginArgs ?? [])],
   });
 
   if (loginExitCode !== 0) {

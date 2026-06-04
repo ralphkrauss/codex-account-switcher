@@ -37,6 +37,8 @@ cx ls
 cx save personal
 cx save personal --force
 cx login work
+cx login personal --device-auth
+cx login work -- --with-api-key
 cx use work
 cx run work -- exec "fix the tests"
 cx run -- --help
@@ -71,6 +73,7 @@ Empty names, dot-only names, slashes, backslashes, spaces, unicode, and path tra
 - Writeback never recreates a deleted active slot.
 - `cx rm <active>` removes the saved slot and clears `.current-account`; it leaves live `auth.json` untouched until you switch or login.
 - `cx save` and `cx rename` refuse overwrites unless `--force` is passed.
+- `cx login <name>` forwards extra arguments to `codex login`, so headless flows such as `cx login personal --device-auth` work on remote machines.
 - `cx doctor` never prints token contents.
 
 ## Migrating from the prototype shell function

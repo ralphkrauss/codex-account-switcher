@@ -42,6 +42,12 @@ interface ParsedForceArgs {
   readonly positionals: readonly string[];
 }
 
+interface ParsedLoginArgs {
+  readonly force: boolean;
+  readonly name: string;
+  readonly loginArgs: readonly string[];
+}
+
 function write(stream: NodeJS.WritableStream, text: string): void {
   stream.write(text.endsWith('\n') ? text : `${text}\n`);
 }
@@ -68,7 +74,7 @@ Usage:
   cx ls
   cx save <name> [--force]
   cx use <name>
-  cx login <name> [--force]
+  cx login <name> [--force] [codex login args...]
   cx rename <old> <new> [--force]
   cx rm <name>
   cx run [name] -- [codex args...]
@@ -86,6 +92,43 @@ Data layout:
   The active account marker is CODEX_HOME/.current-account.
 
 Account names may contain letters, numbers, dot, underscore, and dash only.`;
+}
+
+function parseLoginArgs(args: readonly string[]): ParsedLoginArgs {
+  let force = false;
+  let name: string | null = null;
+  const loginArgs: string[] = [];
+  let afterSeparator = false;
+
+  for (const arg of args) {
+    if (afterSeparator) {
+      loginArgs.push(arg);
+      continue;
+    }
+
+    if (arg === '--') {
+      afterSeparator = true;
+      continue;
+    }
+
+    if (arg === '--force') {
+      force = true;
+      continue;
+    }
+
+    if (name === null) {
+      name = arg;
+      continue;
+    }
+
+    loginArgs.push(arg);
+  }
+
+  if (name === null || name.startsWith('-')) {
+    throw new CxError('usage: cx login <name> [--force] [codex login args...]', 2);
+  }
+
+  return { force, name, loginArgs };
 }
 
 function parseForceArgs(args: readonly string[]): ParsedForceArgs {
@@ -259,11 +302,14 @@ export async function main(
     }
 
     case 'login': {
-      const parsed = parseForceArgs(rest);
-      requireArity('login <name> [--force]', parsed.positionals, 1);
-      const name = parsed.positionals[0] ?? '';
-      await loginAccount(name, { force: parsed.force, env, paths: getCodexPaths(env) });
-      write(io.stdout, `logged in and saved as '${name}'`);
+      const parsed = parseLoginArgs(rest);
+      await loginAccount(parsed.name, {
+        force: parsed.force,
+        loginArgs: parsed.loginArgs,
+        env,
+        paths: getCodexPaths(env),
+      });
+      write(io.stdout, `logged in and saved as '${parsed.name}'`);
       return 0;
     }
 
