@@ -28,6 +28,14 @@ function runCli(args: readonly string[], env: NodeJS.ProcessEnv) {
   });
 }
 
+async function writeFakeCodex(path: string): Promise<void> {
+  const script = process.platform === 'win32'
+    ? '@echo off\r\n(for %%A in (%*) do echo %%~A) > "%CODEX_ARGS_FILE%"\r\n'
+    : `#!/bin/sh\nprintf '%s\\n' "${'$'}@" > "${'$'}CODEX_ARGS_FILE"\n`;
+  await writeFile(path, script);
+  await chmod(path, 0o755);
+}
+
 test('cx --help prints usage', async (t) => {
   const home = await makeHome(t);
   const result = runCli(['--help'], { ...process.env, CODEX_HOME: home });
@@ -86,12 +94,11 @@ test('backward cx <account> switches then launches codex with remaining args', a
   const home = await makeHome(t);
   const bin = join(home, 'bin');
   const argsFile = join(home, 'codex-args.txt');
-  const fakeCodex = join(bin, 'codex');
+  const fakeCodex = join(bin, process.platform === 'win32' ? 'codex.cmd' : 'codex');
   await mkdir(join(home, 'accounts'), { recursive: true });
   await mkdir(bin, { recursive: true });
   await writeFile(join(home, 'accounts', 'work.json'), authPayload('work-account'));
-  await writeFile(fakeCodex, `#!/bin/sh\nprintf '%s\\n' "${'$'}@" > "${'$'}CODEX_ARGS_FILE"\n`);
-  await chmod(fakeCodex, 0o755);
+  await writeFakeCodex(fakeCodex);
 
   const result = runCli(['work', 'exec', 'hello'], {
     ...process.env,
@@ -110,11 +117,10 @@ test('cx run -- uses the current auth and passes codex args after the separator'
   const home = await makeHome(t);
   const bin = join(home, 'bin');
   const argsFile = join(home, 'codex-args.txt');
-  const fakeCodex = join(bin, 'codex');
+  const fakeCodex = join(bin, process.platform === 'win32' ? 'codex.cmd' : 'codex');
   await mkdir(bin, { recursive: true });
   await writeFile(join(home, 'auth.json'), authPayload('current-live'));
-  await writeFile(fakeCodex, `#!/bin/sh\nprintf '%s\\n' "${'$'}@" > "${'$'}CODEX_ARGS_FILE"\n`);
-  await chmod(fakeCodex, 0o755);
+  await writeFakeCodex(fakeCodex);
 
   const result = runCli(['run', '--', 'exec', 'prompt'], {
     ...process.env,

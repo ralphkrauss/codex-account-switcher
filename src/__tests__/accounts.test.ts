@@ -137,8 +137,12 @@ test('rm of active account clears marker and leaves live auth untouched', async 
 test('login runs codex login, saves resulting auth, and honors destination collisions', async (t) => {
   const paths = await makeHome(t);
   await mkdir(paths.home, { recursive: true });
-  const fakeCodex = join(paths.home, 'fake-codex');
-  await writeFile(fakeCodex, `#!/bin/sh\nset -eu\nif [ "${'$'}1" = "login" ]; then\n  mkdir -p "${'$'}CODEX_HOME"\n  printf '%s\\n' '${JSON.stringify({ label: 'logged-in', filler: 'x'.repeat(180) })}' > "${'$'}CODEX_HOME/auth.json"\n  exit 0\nfi\nexit 42\n`);
+  const fakeCodex = join(paths.home, process.platform === 'win32' ? 'fake-codex.cmd' : 'fake-codex');
+  const loginJson = JSON.stringify({ label: 'logged-in', filler: 'x'.repeat(180) });
+  const fakeCodexScript = process.platform === 'win32'
+    ? `@echo off\r\nif "%1"=="login" (\r\n  if not exist "%CODEX_HOME%" mkdir "%CODEX_HOME%"\r\n  > "%CODEX_HOME%\\auth.json" echo ${loginJson}\r\n  exit /b 0\r\n)\r\nexit /b 42\r\n`
+    : `#!/bin/sh\nset -eu\nif [ "${'$'}1" = "login" ]; then\n  mkdir -p "${'$'}CODEX_HOME"\n  printf '%s\\n' '${loginJson}' > "${'$'}CODEX_HOME/auth.json"\n  exit 0\nfi\nexit 42\n`;
+  await writeFile(fakeCodex, fakeCodexScript);
   await chmod(fakeCodex, 0o755);
 
   await loginAccount('fresh', {
