@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test, { type TestContext } from 'node:test';
@@ -104,7 +104,7 @@ test('backward cx <account> switches then launches codex with remaining args', a
     ...process.env,
     CODEX_HOME: home,
     CODEX_ARGS_FILE: argsFile,
-    PATH: `${bin}:${process.env.PATH ?? ''}`,
+    PATH: [bin, process.env.PATH ?? ''].join(delimiter),
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /→ codex on 'work'/);
@@ -126,7 +126,7 @@ test('cx run -- uses the current auth and passes codex args after the separator'
     ...process.env,
     CODEX_HOME: home,
     CODEX_ARGS_FILE: argsFile,
-    PATH: `${bin}:${process.env.PATH ?? ''}`,
+    PATH: [bin, process.env.PATH ?? ''].join(delimiter),
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readFile(argsFile, 'utf8'), 'exec\nprompt\n');

@@ -474,6 +474,7 @@ export async function runCodex(
       env: options.env ?? process.env,
       stdio: 'inherit',
       windowsHide: false,
+      shell: process.platform === 'win32',
     });
 
     child.on('error', (error) => {
