@@ -26,6 +26,7 @@ Requires Node.js 22+ and the native Codex CLI on `PATH`.
 ~/.codex/auth.json                  # Codex's live auth file
 ~/.codex/accounts/<name>.json       # saved account slots
 ~/.codex/.current-account           # active account marker
+~/.codex/remote.json                # optional remote sync backend config
 ```
 
 On POSIX, newly-created directories are `0700` and credential copies are `0600` where supported.
@@ -45,6 +46,11 @@ cx run -- --help
 cx hermes use work
 cx hermes status
 cx hermes sync work
+cx remote configure 1password --vault Private
+cx remote status
+cx sync push work
+cx sync status work
+cx sync pull work --force
 cx rename work work-prod
 cx rm work-prod
 cx doctor
@@ -77,7 +83,7 @@ Empty names, dot-only names, slashes, backslashes, spaces, unicode, and path tra
 - `cx rm <active>` removes the saved slot and clears `.current-account`; it leaves live `auth.json` untouched until you switch or login.
 - `cx save` and `cx rename` refuse overwrites unless `--force` is passed.
 - `cx login <name>` forwards extra arguments to `codex login`, so headless flows such as `cx login personal --device-auth` work on remote machines.
-- `cx doctor` never prints token contents.
+- `cx doctor`, `cx remote status`, and `cx sync status` never print token contents.
 
 ## Hermes integration
 
@@ -94,6 +100,59 @@ cx hermes sync work                 # copy refreshed Hermes tokens back to the c
 `cx hermes use` writes `providers.openai-codex.tokens` and a `credential_pool.openai-codex` entry labelled `cx:<account>`. By default it also sets `model.provider: openai-codex` in Hermes' `config.yaml`.
 
 `cx hermes sync` is the manual writeback path for phase 1: if Hermes refreshes the token in `~/.hermes/auth.json`, this copies that refreshed pair back into `~/.codex/accounts/<account>.json`.
+
+## 1Password remote sync
+
+`cx` can sync saved account slots through 1Password using the 1Password CLI (`op`) as the remote backend. This is intended for moving Codex auth between machines without committing secrets to git or publishing them to npm.
+
+Prerequisites:
+
+- Install 1Password CLI v2 (`op`) on each machine.
+- Sign in first with `op signin`, or set `OP_SERVICE_ACCOUNT_TOKEN` for non-interactive hosts such as EC2.
+- Create or choose a vault where the items should live.
+
+Configure once per `CODEX_HOME`:
+
+```bash
+cx remote configure 1password --vault Private
+cx remote configure 1password --vault Private --item-prefix codex-
+```
+
+The config is written to `~/.codex/remote.json` (or `CODEX_HOME/remote.json`) with mode `0600` where supported. It stores only backend settings such as backend, vault, and item prefix; it does not store token contents.
+
+Check configuration and CLI availability:
+
+```bash
+cx remote status
+cx remote status --json
+```
+
+Push a local account to 1Password:
+
+```bash
+cx sync push work
+```
+
+This reads `~/.codex/accounts/work.json` and upserts it into item `<prefix>work` in the configured vault. The default prefix is `cx-`, so the default item title is `cx-work`.
+
+Pull an account onto another machine:
+
+```bash
+cx sync pull work
+cx sync pull work --force
+```
+
+`pull` refuses to overwrite an existing local `~/.codex/accounts/work.json` unless `--force` is passed.
+
+Compare local and remote presence without printing auth JSON:
+
+```bash
+cx sync status
+cx sync status work
+cx sync status work --json
+```
+
+1Password storage details: `cx` shells out to `op` with argv arrays. Reads use `op item get <item> --vault <vault> --fields label=auth_json --reveal`. Writes use a secure-note item with a concealed field named `auth_json` via `op item create ... auth_json[concealed]=<json>` and `op item edit ... auth_json[concealed]=<json>`. Status commands only report presence/configuration and never reveal field contents.
 
 ## Migrating from the prototype shell function
 

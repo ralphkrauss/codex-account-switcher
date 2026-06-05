@@ -32,6 +32,20 @@ export {
   useHermesAccount,
 } from './hermes.js';
 
+export {
+  DEFAULT_ONEPASSWORD_ITEM_PREFIX,
+  ONEPASSWORD_AUTH_FIELD,
+  ONEPASSWORD_BACKEND,
+  REMOTE_CONFIG_VERSION,
+  configureOnePasswordRemote,
+  getRemoteConfigPath,
+  inspectRemoteStatus,
+  inspectSyncStatus,
+  readRemoteConfig,
+  syncPullAccount,
+  syncPushAccount,
+} from './remote.js';
+
 export type {
   AccountEntry,
   AccountList,
@@ -54,3 +68,20 @@ export type {
   HermesUseOptions,
   HermesUseResult,
 } from './hermes.js';
+
+export type {
+  ConfigureOnePasswordRemoteInput,
+  ConfigureRemoteResult,
+  OnePasswordRemoteConfig,
+  RemoteBackend,
+  RemoteCliOptions,
+  RemoteConfig,
+  RemoteForceOptions,
+  RemotePathOptions,
+  RemotePresence,
+  RemoteStatus,
+  SyncPullResult,
+  SyncPushResult,
+  SyncStatus,
+  SyncStatusAccount,
+} from './remote.js';

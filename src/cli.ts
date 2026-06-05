@@ -5,9 +5,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CxError,
   authFileExists,
+  configureOnePasswordRemote,
   getCodexPaths,
   inspectHermesStatus,
   inspectDoctor,
+  inspectRemoteStatus,
+  inspectSyncStatus,
   listAccounts,
   loginAccount,
   removeAccount,
@@ -15,12 +18,16 @@ import {
   runCodex,
   saveAccount,
   syncHermesAccount,
+  syncPullAccount,
+  syncPushAccount,
   useAccount,
   useHermesAccount,
   validateAccountName,
   type AccountList,
   type DoctorReport,
   type HermesStatus,
+  type RemoteStatus,
+  type SyncStatus,
 } from './index.js';
 
 const PACKAGE_NAME = '@ralphkrauss/codex-account-switcher';
@@ -31,9 +38,11 @@ const SUBCOMMANDS = new Set([
   'login',
   'ls',
   'rename',
+  'remote',
   'rm',
   'run',
   'save',
+  'sync',
   'use',
 ]);
 
@@ -58,6 +67,16 @@ interface ParsedHermesArgs {
   readonly noConfig: boolean;
   readonly profile?: string;
   readonly positionals: readonly string[];
+}
+
+interface ParsedJsonArgs {
+  readonly json: boolean;
+  readonly positionals: readonly string[];
+}
+
+interface ParsedRemoteConfigureArgs {
+  readonly vault: string;
+  readonly itemPrefix?: string;
 }
 
 function write(stream: NodeJS.WritableStream, text: string): void {
@@ -93,6 +112,11 @@ Usage:
   cx hermes use <account> [--profile <name>] [--no-config]
   cx hermes sync <account> [--profile <name>]
   cx hermes status [--profile <name>] [--json]
+  cx remote configure 1password --vault <vault> [--item-prefix <prefix>]
+  cx remote status [--json]
+  cx sync push <account>
+  cx sync pull <account> [--force]
+  cx sync status [account] [--json]
   cx doctor [--json]
   cx --help
   cx --version
@@ -105,6 +129,7 @@ Data layout:
   Uses CODEX_HOME when set, otherwise ~/.codex.
   Accounts are stored as CODEX_HOME/accounts/<name>.json.
   The active account marker is CODEX_HOME/.current-account.
+  Remote sync config is stored as CODEX_HOME/remote.json.
 
 Account names may contain letters, numbers, dot, underscore, and dash only.`;
 }
@@ -124,6 +149,32 @@ Commands:
 Paths:
   Default Hermes home uses HERMES_HOME when set, otherwise ~/.hermes.
   --profile <name> explicitly targets ~/.hermes/profiles/<name>.`;
+}
+
+function remoteHelpText(): string {
+  return `Usage:
+  cx remote configure 1password --vault <vault> [--item-prefix <prefix>]
+  cx remote status [--json]
+
+Commands:
+  configure  Store remote sync settings in CODEX_HOME/remote.json.
+  status     Show configured backend/vault/prefix and whether the op CLI is available.
+
+Notes:
+  The default 1Password item prefix is cx-. Token contents are never printed.`;
+}
+
+function syncHelpText(): string {
+  return `Usage:
+  cx sync push <account>
+  cx sync pull <account> [--force]
+  cx sync status [account] [--json]
+
+Commands:
+  push    Upsert CODEX_HOME/accounts/<account>.json into the configured 1Password item.
+  pull    Read the configured 1Password item into CODEX_HOME/accounts/<account>.json.
+          Refuses to overwrite unless --force is passed.
+  status  Compare local account-file presence with remote item presence without printing tokens.`;
 }
 
 function parseHermesArgs(
@@ -168,6 +219,62 @@ function parseHermesArgs(
   }
 
   return { json, noConfig, ...(profile ? { profile } : {}), positionals };
+}
+
+function parseJsonArgs(args: readonly string[]): ParsedJsonArgs {
+  let json = false;
+  const positionals: string[] = [];
+  for (const arg of args) {
+    if (arg === '--json') {
+      json = true;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      throw new CxError(`unknown option '${arg}'`, 2);
+    }
+    positionals.push(arg);
+  }
+  return { json, positionals };
+}
+
+function parseRemoteConfigureArgs(args: readonly string[]): ParsedRemoteConfigureArgs {
+  const [backend, ...rest] = args;
+  if (backend !== '1password') {
+    throw new CxError('usage: cx remote configure 1password --vault <vault> [--item-prefix <prefix>]', 2);
+  }
+
+  let vault: string | undefined;
+  let itemPrefix: string | undefined;
+  for (let index = 0; index < rest.length; index += 1) {
+    const arg = rest[index] ?? '';
+    if (arg === '--vault') {
+      const value = rest[index + 1];
+      if (!value || value.startsWith('-')) {
+        throw new CxError('usage: cx remote configure 1password --vault <vault> [--item-prefix <prefix>]', 2);
+      }
+      vault = value;
+      index += 1;
+      continue;
+    }
+    if (arg === '--item-prefix') {
+      const value = rest[index + 1];
+      if (!value || value.startsWith('-')) {
+        throw new CxError('usage: cx remote configure 1password --vault <vault> [--item-prefix <prefix>]', 2);
+      }
+      itemPrefix = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      throw new CxError(`unknown option '${arg}'`, 2);
+    }
+    throw new CxError('usage: cx remote configure 1password --vault <vault> [--item-prefix <prefix>]', 2);
+  }
+
+  if (!vault) {
+    throw new CxError('usage: cx remote configure 1password --vault <vault> [--item-prefix <prefix>]', 2);
+  }
+  return { vault, ...(itemPrefix ? { itemPrefix } : {}) };
 }
 
 function parseLoginArgs(args: readonly string[]): ParsedLoginArgs {
@@ -317,6 +424,51 @@ function formatHermesStatus(status: HermesStatus): string {
   return lines.join('\n');
 }
 
+function formatRemoteStatus(status: RemoteStatus): string {
+  const lines = [
+    'Remote sync status',
+    `config: ${status.configPath}`,
+    `configured: ${yesNo(status.configured)}`,
+    `backend: ${status.backend ?? '(not configured)'}`,
+    `vault: ${status.vault ?? '(not configured)'}`,
+    `item prefix: ${status.itemPrefix ?? '(not configured)'}`,
+    `op CLI: ${status.opAvailable ? `available (${status.opPath ?? 'op'})` : 'not found'}`,
+  ];
+  return lines.join('\n');
+}
+
+function remotePresenceText(status: SyncStatus['accounts'][number]): string {
+  if (status.remote.presence === 'unknown') {
+    return status.remote.error ? `unknown (${status.remote.error})` : 'unknown';
+  }
+  return status.remote.presence;
+}
+
+function formatSyncStatus(status: SyncStatus): string {
+  const lines = [
+    'Remote sync status',
+    `config: ${status.configPath}`,
+    `configured: ${yesNo(status.configured)}`,
+    `backend: ${status.backend ?? '(not configured)'}`,
+    `vault: ${status.vault ?? '(not configured)'}`,
+    `item prefix: ${status.itemPrefix ?? '(not configured)'}`,
+    `op CLI: ${status.opAvailable ? `available (${status.opPath ?? 'op'})` : 'not found'}`,
+  ];
+
+  if (status.accounts.length === 0) {
+    lines.push('accounts: (none)');
+    return lines.join('\n');
+  }
+
+  lines.push('accounts:');
+  for (const account of status.accounts) {
+    lines.push(`  - ${account.account}: local=${account.local.exists ? 'present' : 'missing'}, remote=${remotePresenceText(account)}`);
+    lines.push(`    file: ${account.local.file}`);
+    lines.push(`    item: ${account.item ?? '(unknown)'}`);
+  }
+  return lines.join('\n');
+}
+
 async function printList(io: CliIo, env: NodeJS.ProcessEnv): Promise<void> {
   write(io.stdout, formatAccounts(await listAccounts(getCodexPaths(env))));
 }
@@ -401,6 +553,93 @@ async function handleHermesCommand(
 
     default:
       throw new CxError(`unknown hermes command '${command}'`, 2);
+  }
+}
+
+async function handleRemoteCommand(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  io: CliIo,
+): Promise<number> {
+  const [command, ...rest] = args;
+  if (!command || command === 'help' || command === '--help' || command === '-h') {
+    write(io.stdout, remoteHelpText());
+    return 0;
+  }
+
+  switch (command) {
+    case 'configure': {
+      const parsed = parseRemoteConfigureArgs(rest);
+      const result = await configureOnePasswordRemote(parsed, { paths: getCodexPaths(env) });
+      write(io.stdout, 'configured remote backend: 1password');
+      write(io.stdout, `config: ${result.configPath}`);
+      write(io.stdout, `vault: ${result.config.vault}`);
+      write(io.stdout, `item prefix: ${result.config.itemPrefix}`);
+      return 0;
+    }
+
+    case 'status': {
+      const parsed = parseJsonArgs(rest);
+      requireArity('remote status [--json]', parsed.positionals, 0);
+      const status = await inspectRemoteStatus({ env, paths: getCodexPaths(env) });
+      write(io.stdout, parsed.json ? JSON.stringify(status, null, 2) : formatRemoteStatus(status));
+      return 0;
+    }
+
+    default:
+      throw new CxError(`unknown remote command '${command}'`, 2);
+  }
+}
+
+async function handleSyncCommand(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  io: CliIo,
+): Promise<number> {
+  const [command, ...rest] = args;
+  if (!command || command === 'help' || command === '--help' || command === '-h') {
+    write(io.stdout, syncHelpText());
+    return 0;
+  }
+
+  switch (command) {
+    case 'push': {
+      requireArity('sync push <account>', rest, 1);
+      const account = rest[0] ?? '';
+      const result = await syncPushAccount(account, { env, paths: getCodexPaths(env) });
+      write(io.stdout, `pushed account '${result.account}' to 1Password item '${result.item}'`);
+      write(io.stdout, `vault: ${result.vault}`);
+      write(io.stdout, `operation: ${result.operation}`);
+      return 0;
+    }
+
+    case 'pull': {
+      const parsed = parseForceArgs(rest);
+      requireArity('sync pull <account> [--force]', parsed.positionals, 1);
+      const account = parsed.positionals[0] ?? '';
+      const result = await syncPullAccount(account, {
+        env,
+        paths: getCodexPaths(env),
+        force: parsed.force,
+      });
+      write(io.stdout, `pulled 1Password item '${result.item}' into account '${result.account}'`);
+      write(io.stdout, `account file: ${result.accountFile}`);
+      write(io.stdout, `overwrote local account: ${yesNo(result.overwritten)}`);
+      return 0;
+    }
+
+    case 'status': {
+      const parsed = parseJsonArgs(rest);
+      if (parsed.positionals.length > 1) {
+        throw new CxError('usage: cx sync status [account] [--json]', 2);
+      }
+      const status = await inspectSyncStatus(parsed.positionals[0], { env, paths: getCodexPaths(env) });
+      write(io.stdout, parsed.json ? JSON.stringify(status, null, 2) : formatSyncStatus(status));
+      return 0;
+    }
+
+    default:
+      throw new CxError(`unknown sync command '${command}'`, 2);
   }
 }
 
@@ -528,6 +767,12 @@ export async function main(
 
     case 'hermes':
       return await handleHermesCommand(rest, env, io);
+
+    case 'remote':
+      return await handleRemoteCommand(rest, env, io);
+
+    case 'sync':
+      return await handleSyncCommand(rest, env, io);
 
     default:
       throw new CxError(`unknown command '${first}'`, 2);
