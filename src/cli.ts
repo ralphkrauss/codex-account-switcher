@@ -6,6 +6,7 @@ import {
   CxError,
   authFileExists,
   getCodexPaths,
+  inspectHermesStatus,
   inspectDoctor,
   listAccounts,
   loginAccount,
@@ -13,15 +14,19 @@ import {
   renameAccount,
   runCodex,
   saveAccount,
+  syncHermesAccount,
   useAccount,
+  useHermesAccount,
   validateAccountName,
   type AccountList,
   type DoctorReport,
+  type HermesStatus,
 } from './index.js';
 
 const PACKAGE_NAME = '@ralphkrauss/codex-account-switcher';
 const SUBCOMMANDS = new Set([
   'doctor',
+  'hermes',
   'help',
   'login',
   'ls',
@@ -46,6 +51,13 @@ interface ParsedLoginArgs {
   readonly force: boolean;
   readonly name: string;
   readonly loginArgs: readonly string[];
+}
+
+interface ParsedHermesArgs {
+  readonly json: boolean;
+  readonly noConfig: boolean;
+  readonly profile?: string;
+  readonly positionals: readonly string[];
 }
 
 function write(stream: NodeJS.WritableStream, text: string): void {
@@ -78,6 +90,9 @@ Usage:
   cx rename <old> <new> [--force]
   cx rm <name>
   cx run [name] -- [codex args...]
+  cx hermes use <account> [--profile <name>] [--no-config]
+  cx hermes sync <account> [--profile <name>]
+  cx hermes status [--profile <name>] [--json]
   cx doctor [--json]
   cx --help
   cx --version
@@ -92,6 +107,67 @@ Data layout:
   The active account marker is CODEX_HOME/.current-account.
 
 Account names may contain letters, numbers, dot, underscore, and dash only.`;
+}
+
+function hermesHelpText(): string {
+  return `Usage:
+  cx hermes use <account> [--profile <name>] [--no-config]
+  cx hermes sync <account> [--profile <name>]
+  cx hermes status [--profile <name>] [--json]
+
+Commands:
+  use      Import CODEX_HOME/accounts/<account>.json into Hermes openai-codex auth.
+           Also sets model.provider=openai-codex unless --no-config is passed.
+  sync     Copy Hermes openai-codex tokens back to the cx account slot.
+  status   Show the selected Hermes home, auth/config state, and linked cx account.
+
+Paths:
+  Default Hermes home uses HERMES_HOME when set, otherwise ~/.hermes.
+  --profile <name> explicitly targets ~/.hermes/profiles/<name>.`;
+}
+
+function parseHermesArgs(
+  command: string,
+  args: readonly string[],
+  allowed: { readonly json?: boolean; readonly noConfig?: boolean },
+): ParsedHermesArgs {
+  let json = false;
+  let noConfig = false;
+  let profile: string | undefined;
+  const positionals: string[] = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index] ?? '';
+    if (arg === '--profile') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        throw new CxError(`usage: cx hermes ${command}`, 2);
+      }
+      profile = value;
+      index += 1;
+      continue;
+    }
+    if (arg === '--json') {
+      if (allowed.json !== true) {
+        throw new CxError(`unknown option '${arg}'`, 2);
+      }
+      json = true;
+      continue;
+    }
+    if (arg === '--no-config') {
+      if (allowed.noConfig !== true) {
+        throw new CxError(`unknown option '${arg}'`, 2);
+      }
+      noConfig = true;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      throw new CxError(`unknown option '${arg}'`, 2);
+    }
+    positionals.push(arg);
+  }
+
+  return { json, noConfig, ...(profile ? { profile } : {}), positionals };
 }
 
 function parseLoginArgs(args: readonly string[]): ParsedLoginArgs {
@@ -204,6 +280,43 @@ function formatDoctor(report: DoctorReport): string {
   return lines.join('\n');
 }
 
+function yesNo(value: boolean): string {
+  return value ? 'yes' : 'no';
+}
+
+function formatHermesStatus(status: HermesStatus): string {
+  const tokenBits = status.hasTokens
+    ? `access=${yesNo(status.hasAccessToken)}, refresh=${yesNo(status.hasRefreshToken)}`
+    : 'missing';
+  const linked = status.linkedAccounts.length === 0
+    ? '(none detected)'
+    : status.linkedAccounts.join(', ');
+  const lines = [
+    'Hermes Codex integration status',
+    `profile: ${status.profile ?? 'default'}`,
+    `hermes home: ${status.hermesHome}`,
+    `auth.json: ${status.authExists ? 'present' : 'missing'}`,
+    `auth readable: ${yesNo(status.authReadable)}`,
+    `openai-codex auth: ${status.openaiCodexAuthExists ? 'present' : 'missing'}`,
+    `tokens: ${tokenBits}`,
+    `last refresh: ${status.lastRefresh ?? '(unknown)'}`,
+    `auth mode: ${status.authMode ?? '(unknown)'}`,
+    `credential pool openai-codex entries: ${status.poolEntryCount}`,
+    `linked cx account: ${linked}`,
+    `configured provider: ${status.configuredProvider ?? '(not set)'}`,
+    `config.yaml: ${status.configExists ? 'present' : 'missing'}`,
+  ];
+
+  if (status.authError) {
+    lines.push(`auth warning: ${status.authError}`);
+  }
+  if (status.configError) {
+    lines.push(`config warning: ${status.configError}`);
+  }
+
+  return lines.join('\n');
+}
+
 async function printList(io: CliIo, env: NodeJS.ProcessEnv): Promise<void> {
   write(io.stdout, formatAccounts(await listAccounts(getCodexPaths(env))));
 }
@@ -229,6 +342,66 @@ function parseRunArgs(args: readonly string[]): { account: string | null; codexA
     throw new CxError("usage: cx run [name] -- [codex args...] (use '--' before codex flags)", 2);
   }
   return { account, codexArgs };
+}
+
+async function handleHermesCommand(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  io: CliIo,
+): Promise<number> {
+  const [command, ...rest] = args;
+  if (!command || command === 'help' || command === '--help' || command === '-h') {
+    write(io.stdout, hermesHelpText());
+    return 0;
+  }
+
+  switch (command) {
+    case 'use': {
+      const parsed = parseHermesArgs('use <account> [--profile <name>] [--no-config]', rest, { noConfig: true });
+      requireArity('hermes use <account> [--profile <name>] [--no-config]', parsed.positionals, 1);
+      const account = parsed.positionals[0] ?? '';
+      const result = await useHermesAccount(account, {
+        env,
+        ...(parsed.profile ? { profile: parsed.profile } : {}),
+        updateConfig: !parsed.noConfig,
+      });
+      write(io.stdout, `Hermes openai-codex auth now uses cx account '${result.account}'`);
+      write(io.stdout, `hermes home: ${result.hermesHome}`);
+      write(io.stdout, `auth.json: ${result.hermesAuthFile}`);
+      write(io.stdout, result.hermesConfigFile
+        ? `config.yaml: ${result.hermesConfigFile} (model.provider=openai-codex)`
+        : 'config.yaml: skipped (--no-config)');
+      return 0;
+    }
+
+    case 'sync': {
+      const parsed = parseHermesArgs('sync <account> [--profile <name>]', rest, {});
+      requireArity('hermes sync <account> [--profile <name>]', parsed.positionals, 1);
+      const account = parsed.positionals[0] ?? '';
+      const result = await syncHermesAccount(account, {
+        env,
+        ...(parsed.profile ? { profile: parsed.profile } : {}),
+      });
+      write(io.stdout, `synced Hermes openai-codex tokens to cx account '${result.account}'`);
+      write(io.stdout, `cx account file: ${result.codexAccountFile}`);
+      write(io.stdout, `hermes home: ${result.hermesHome}`);
+      return 0;
+    }
+
+    case 'status': {
+      const parsed = parseHermesArgs('status [--profile <name>] [--json]', rest, { json: true });
+      requireArity('hermes status [--profile <name>] [--json]', parsed.positionals, 0);
+      const status = await inspectHermesStatus({
+        env,
+        ...(parsed.profile ? { profile: parsed.profile } : {}),
+      });
+      write(io.stdout, parsed.json ? JSON.stringify(status, null, 2) : formatHermesStatus(status));
+      return 0;
+    }
+
+    default:
+      throw new CxError(`unknown hermes command '${command}'`, 2);
+  }
 }
 
 export async function main(
@@ -352,6 +525,9 @@ export async function main(
       write(io.stdout, json ? JSON.stringify(report, null, 2) : formatDoctor(report));
       return 0;
     }
+
+    case 'hermes':
+      return await handleHermesCommand(rest, env, io);
 
     default:
       throw new CxError(`unknown command '${first}'`, 2);

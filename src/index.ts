@@ -23,6 +23,15 @@ export {
   writebackCurrentAccount,
 } from './accounts.js';
 
+export {
+  HERMES_CODEX_BASE_URL,
+  HERMES_OPENAI_CODEX_PROVIDER,
+  getHermesPaths,
+  inspectHermesStatus,
+  syncHermesAccount,
+  useHermesAccount,
+} from './hermes.js';
+
 export type {
   AccountEntry,
   AccountList,
@@ -36,3 +45,12 @@ export type {
   SpawnCodexOptions,
   WritebackResult,
 } from './accounts.js';
+
+export type {
+  HermesPaths,
+  HermesProfileOptions,
+  HermesStatus,
+  HermesSyncResult,
+  HermesUseOptions,
+  HermesUseResult,
+} from './hermes.js';

@@ -42,6 +42,9 @@ cx login work -- --with-api-key
 cx use work
 cx run work -- exec "fix the tests"
 cx run -- --help
+cx hermes use work
+cx hermes status
+cx hermes sync work
 cx rename work work-prod
 cx rm work-prod
 cx doctor
@@ -75,6 +78,22 @@ Empty names, dot-only names, slashes, backslashes, spaces, unicode, and path tra
 - `cx save` and `cx rename` refuse overwrites unless `--force` is passed.
 - `cx login <name>` forwards extra arguments to `codex login`, so headless flows such as `cx login personal --device-auth` work on remote machines.
 - `cx doctor` never prints token contents.
+
+## Hermes integration
+
+`cx` can seed Hermes' existing `openai-codex` auth store from a saved cx account without changing or forking Hermes:
+
+```bash
+cx hermes use work                  # import ~/.codex/accounts/work.json into ~/.hermes/auth.json
+cx hermes use work --profile team   # target ~/.hermes/profiles/team/auth.json
+cx hermes use work --no-config      # import auth only; leave config.yaml untouched
+cx hermes status                    # show auth/config state without printing token values
+cx hermes sync work                 # copy refreshed Hermes tokens back to the cx account slot
+```
+
+`cx hermes use` writes `providers.openai-codex.tokens` and a `credential_pool.openai-codex` entry labelled `cx:<account>`. By default it also sets `model.provider: openai-codex` in Hermes' `config.yaml`.
+
+`cx hermes sync` is the manual writeback path for phase 1: if Hermes refreshes the token in `~/.hermes/auth.json`, this copies that refreshed pair back into `~/.codex/accounts/<account>.json`.
 
 ## Migrating from the prototype shell function
 
