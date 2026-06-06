@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.8 - 2026-06-06
+
+### Fixed
+
+- Fix `cx sync push <inactive-account>` so it no longer writes the live `auth.json` back to a different active marker or fails with `unexpected writeback account ...`.
+- Fix `cx sync push --all` when a current account marker exists by only writing refreshed live auth back for the profile currently being pushed.
+
 ## 0.1.7 - 2026-06-06
 
 ### Added

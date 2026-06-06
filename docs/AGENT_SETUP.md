@@ -297,6 +297,29 @@ Use force deliberately:
 cx sync pull <PROFILE_NAME> --force
 ```
 
+### I ran raw `codex login` while another profile was active
+
+If the live `~/.codex/auth.json` is now the refreshed profile but `cx ls` still marks a different profile active, first save the live auth into the intended profile slot:
+
+```bash
+cx save <PROFILE_NAME> --force
+cx sync push <PROFILE_NAME>
+```
+
+Example:
+
+```bash
+cx save personal --force
+cx sync push personal
+```
+
+Then restore/switch any other profile from 1Password if needed:
+
+```bash
+cx sync pull gi --force
+cx use gi
+```
+
 ### Need to migrate from the old shell script
 
 Keep credential data, remove only the sourced script/hook:

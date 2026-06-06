@@ -16,6 +16,7 @@ import {
   accountPathForName,
   getCodexPaths,
   listAccountNames,
+  readCurrentMarker,
   resolveExecutable,
   useAccount,
   validateAccountName,
@@ -699,6 +700,17 @@ async function readLocalAccountAuthJson(
   return { account: safeAccount, accountFile, authJson };
 }
 
+async function writebackCurrentAccountIfSyncTarget(
+  targetAccount: string,
+  paths: CodexPaths,
+): Promise<void> {
+  const current = await readCurrentMarker(paths);
+  if (current.state === 'valid' && current.name !== targetAccount) {
+    return;
+  }
+  await writebackCurrentAccount({ paths });
+}
+
 async function writeLocalAccountAuthJson(
   account: string,
   authJson: string,
@@ -725,10 +737,7 @@ export async function syncPushAccount(
   const paths = remotePaths(options);
   const config = await requireRemoteConfig({ paths });
   const safeAccount = validateRemoteSyncAccountName(account);
-  const writeback = await writebackCurrentAccount({ paths });
-  if (writeback.performed === true && writeback.account !== safeAccount) {
-    throw new CxError(`unexpected writeback account '${writeback.account}' while syncing '${safeAccount}'`, 1);
-  }
+  await writebackCurrentAccountIfSyncTarget(safeAccount, paths);
   const local = await readLocalAccountAuthJson(safeAccount, paths);
   const item = itemTitle(config, local.account);
   const operation = await upsertOnePasswordAuthJson(config, item, local.authJson, env);

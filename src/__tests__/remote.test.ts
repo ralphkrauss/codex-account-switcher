@@ -330,6 +330,24 @@ test('sync push writes back refreshed live auth for the active account before up
   assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), refreshedAuth);
 });
 
+test('sync push of an inactive account does not write back or corrupt the active slot', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+  const giAuth = `${JSON.stringify({ account: 'gi', token: 'saved-gi', filler: 'x'.repeat(200) })}\n`;
+  const personalAuth = `${JSON.stringify({ account: 'personal', token: 'saved-personal', filler: 'x'.repeat(200) })}\n`;
+  const directLoginAuth = `${JSON.stringify({ account: 'personal', token: 'direct-login', filler: 'x'.repeat(200) })}\n`;
+  await writeAccount(sandbox.paths, 'gi', giAuth);
+  await writeAccount(sandbox.paths, 'personal', personalAuth);
+  await useAccount('gi', { paths: sandbox.paths });
+  await writeFile(sandbox.paths.authFile, directLoginAuth);
+
+  await syncPushAccount('personal', { paths: sandbox.paths, env: sandbox.env });
+
+  const store = await readStore(sandbox.storeFile);
+  assert.deepEqual(JSON.parse(storedAuthJson(store, 'Dev', 'cx-personal')) as unknown, JSON.parse(personalAuth) as unknown);
+  assert.equal(await readFile(accountPathForName(sandbox.paths, 'gi'), 'utf8'), giAuth);
+});
+
 test('remote sync ignores reserved default slot and rejects explicit default sync', async (t) => {
   const sandbox = await makeSandbox(t);
   await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
