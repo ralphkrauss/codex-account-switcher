@@ -15,6 +15,7 @@ import {
   readRemoteConfig,
   syncPullAccount,
   syncPushAccount,
+  useAccount,
 } from '../index.js';
 
 const cliPath = fileURLToPath(new URL('../cli.js', import.meta.url));
@@ -83,7 +84,7 @@ if (action === 'get') {
   }
   if (args.includes('--format')) {
     save(store);
-    process.stdout.write(JSON.stringify({ title, vault, fields: [{ label: 'auth_json', type: 'CONCEALED' }] }));
+    process.stdout.write(JSON.stringify({ title, vault, fields: [{ label: 'auth_json', type: 'CONCEALED', value: item.auth_json }] }));
     process.exit(0);
   }
   if (args.includes('--fields')) {
@@ -286,6 +287,22 @@ test('sync push creates and edits 1Password auth_json, and pull writes local acc
   const forced = await syncPullAccount('work', { paths: sandbox.paths, env: sandbox.env, force: true });
   assert.equal(forced.overwritten, true);
   assert.equal(await readFile(accountFile, 'utf8'), secondAuth);
+});
+
+test('sync push writes back refreshed live auth for the active account before uploading', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+  const staleAuth = `${JSON.stringify({ account: 'work', token: 'stale', filler: 'x'.repeat(200) })}\n`;
+  const refreshedAuth = `${JSON.stringify({ account: 'work', token: 'refreshed', filler: 'x'.repeat(200) })}\n`;
+  await writeAccount(sandbox.paths, 'work', staleAuth);
+  await useAccount('work', { paths: sandbox.paths });
+  await writeFile(sandbox.paths.authFile, refreshedAuth);
+
+  await syncPushAccount('work', { paths: sandbox.paths, env: sandbox.env });
+
+  const store = await readStore(sandbox.storeFile);
+  assert.deepEqual(JSON.parse(storedAuthJson(store, 'Dev', 'cx-work')) as unknown, JSON.parse(refreshedAuth) as unknown);
+  assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), refreshedAuth);
 });
 
 test('remote sync ignores reserved default slot and rejects explicit default sync', async (t) => {

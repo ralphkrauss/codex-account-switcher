@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 - 2026-06-06
+
+### Fixed
+
+- Read multiline concealed `auth_json` values from 1Password item JSON so `cx sync pull` round-trips pretty-printed Codex auth files.
+- Write back the active live `auth.json` before `cx sync push <account>` so refreshed Codex tokens are uploaded.
+
 ## 0.1.4 - 2026-06-06
 
 ### Changed

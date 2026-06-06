@@ -18,6 +18,7 @@ import {
   listAccountNames,
   resolveExecutable,
   validateAccountName,
+  writebackCurrentAccount,
   type CodexPaths,
 } from './accounts.js';
 
@@ -518,12 +519,64 @@ function decodeAuthJsonField(stdout: string, item: string): string {
   }
 }
 
+function decodeAuthJsonFieldFromItemJson(stdout: string, item: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout) as unknown;
+  } catch (error) {
+    throw new CxError(`1Password item '${item}' JSON could not be parsed: ${errorMessage(error)}`, 1);
+  }
+
+  if (!isRecord(parsed) || !Array.isArray(parsed.fields)) {
+    throw new CxError(`1Password item '${item}' does not contain fields metadata`, 1);
+  }
+
+  const field = parsed.fields.find((candidate: unknown): candidate is Record<string, unknown> => (
+    isRecord(candidate) && candidate.label === ONEPASSWORD_AUTH_FIELD
+  ));
+  if (!field) {
+    throw new CxError(`1Password item '${item}' does not contain a revealable '${ONEPASSWORD_AUTH_FIELD}' field`, 1);
+  }
+  if (typeof field.value !== 'string') {
+    throw new CxError(`1Password item '${item}' field '${ONEPASSWORD_AUTH_FIELD}' did not contain a string value`, 1);
+  }
+
+  parseAuthJsonString(field.value, `auth_json field in 1Password item '${item}'`);
+  return field.value;
+}
+
 async function readOnePasswordAuthJson(
   config: RemoteConfig,
   item: string,
   env: NodeJS.ProcessEnv,
 ): Promise<string> {
-  const result = await runOpRaw([
+  const jsonResult = await runOpRaw([
+    'item',
+    'get',
+    item,
+    '--vault',
+    config.vault,
+    '--format',
+    'json',
+  ], env);
+
+  if (jsonResult.exitCode === 0) {
+    try {
+      return decodeAuthJsonFieldFromItemJson(jsonResult.stdout, item);
+    } catch (error) {
+      if (!errorMessage(error).includes(`'${ONEPASSWORD_AUTH_FIELD}'`)) {
+        throw error;
+      }
+      // Fall through to the field-specific command for older op/item shapes.
+    }
+  } else {
+    if (looksLikeMissingItem(jsonResult)) {
+      throw new CxError(`remote account item '${item}' was not found in 1Password vault '${config.vault}'`, 1);
+    }
+    throwOpFailure(`reading 1Password item '${item}'`, jsonResult);
+  }
+
+  const fieldResult = await runOpRaw([
     'item',
     'get',
     item,
@@ -534,16 +587,16 @@ async function readOnePasswordAuthJson(
     '--reveal',
   ], env);
 
-  if (result.exitCode === 0) {
-    return decodeAuthJsonField(result.stdout, item);
+  if (fieldResult.exitCode === 0) {
+    return decodeAuthJsonField(fieldResult.stdout, item);
   }
-  if (looksLikeMissingField(result)) {
+  if (looksLikeMissingField(fieldResult)) {
     throw new CxError(`1Password item '${item}' does not contain a revealable '${ONEPASSWORD_AUTH_FIELD}' field`, 1);
   }
-  if (looksLikeMissingItem(result)) {
+  if (looksLikeMissingItem(fieldResult)) {
     throw new CxError(`remote account item '${item}' was not found in 1Password vault '${config.vault}'`, 1);
   }
-  throwOpFailure(`reading '${ONEPASSWORD_AUTH_FIELD}' from 1Password item '${item}'`, result);
+  throwOpFailure(`reading '${ONEPASSWORD_AUTH_FIELD}' from 1Password item '${item}'`, fieldResult);
 }
 
 async function readLocalAccountAuthJson(
@@ -590,10 +643,13 @@ export async function syncPushAccount(
 ): Promise<SyncPushResult> {
   const env = options.env ?? process.env;
   const paths = remotePaths(options);
-  const [config, local] = await Promise.all([
-    requireRemoteConfig({ paths }),
-    readLocalAccountAuthJson(account, paths),
-  ]);
+  const config = await requireRemoteConfig({ paths });
+  const safeAccount = validateRemoteSyncAccountName(account);
+  const writeback = await writebackCurrentAccount({ paths });
+  if (writeback.performed === true && writeback.account !== safeAccount) {
+    throw new CxError(`unexpected writeback account '${writeback.account}' while syncing '${safeAccount}'`, 1);
+  }
+  const local = await readLocalAccountAuthJson(safeAccount, paths);
   const item = itemTitle(config, local.account);
   const operation = await upsertOnePasswordAuthJson(config, item, local.authJson, env);
 
