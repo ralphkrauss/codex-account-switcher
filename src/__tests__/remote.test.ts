@@ -12,8 +12,11 @@ import {
   getRemoteConfigPath,
   inspectRemoteStatus,
   inspectSyncStatus,
+  setupOnePasswordProfiles,
   readRemoteConfig,
+  syncPullAllAccounts,
   syncPullAccount,
+  syncPushAllAccounts,
   syncPushAccount,
   useAccount,
 } from '../index.js';
@@ -67,11 +70,33 @@ function fail(message, code = 1) {
   process.exit(code);
 }
 
+if (args[0] === 'vault' && args[1] === 'get') {
+  const vault = args[2];
+  if (!vault) {
+    fail('missing vault');
+  }
+  vaultItems(store, vault);
+  save(store);
+  process.stdout.write(JSON.stringify({ id: vault, name: vault }));
+  process.exit(0);
+}
+
 if (args[0] !== 'item') {
   fail('unsupported command');
 }
 
 const action = args[1];
+if (action === 'list') {
+  const vault = option(args, '--vault');
+  if (!vault) {
+    fail('missing vault');
+  }
+  const items = vaultItems(store, vault);
+  save(store);
+  process.stdout.write(JSON.stringify(Object.keys(items).sort().map((title) => ({ title, vault }))));
+  process.exit(0);
+}
+
 if (action === 'get') {
   const title = args[2];
   const vault = option(args, '--vault');
@@ -328,6 +353,91 @@ test('remote sync ignores reserved default slot and rejects explicit default syn
     () => inspectSyncStatus('default', { paths: sandbox.paths, env: sandbox.env }),
     /reserved for the live Codex auth/u,
   );
+});
+
+test('sync status and bulk pull treat 1Password items as native remote-backed profiles', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+
+  await writeAccount(sandbox.paths, 'local-only', `${JSON.stringify({ account: 'local-only' })}\n`);
+  await writeAccount(sandbox.paths, 'default', `${JSON.stringify({ account: 'default' })}\n`);
+  await writeAccount(sandbox.paths, 'remote-work', `${JSON.stringify({ account: 'remote-work', source: 'seed' })}\n`);
+  await syncPushAccount('remote-work', { paths: sandbox.paths, env: sandbox.env });
+  await writeAccount(sandbox.paths, 'remote-personal', `${JSON.stringify({ account: 'remote-personal', source: 'seed' })}\n`);
+  await syncPushAccount('remote-personal', { paths: sandbox.paths, env: sandbox.env });
+  await rm(accountPathForName(sandbox.paths, 'remote-work'));
+  await rm(accountPathForName(sandbox.paths, 'remote-personal'));
+
+  const status = await inspectSyncStatus(undefined, { paths: sandbox.paths, env: sandbox.env });
+  assert.deepEqual(status.accounts.map((entry) => entry.account), ['local-only', 'remote-personal', 'remote-work']);
+  assert.equal(status.accounts.find((entry) => entry.account === 'remote-work')?.local.exists, false);
+  assert.equal(status.accounts.find((entry) => entry.account === 'remote-work')?.remote.presence, 'present');
+
+  const pulled = await syncPullAllAccounts({ paths: sandbox.paths, env: sandbox.env });
+  assert.deepEqual(pulled.map((entry) => entry.account), ['remote-personal', 'remote-work']);
+  assert.match(await readFile(accountPathForName(sandbox.paths, 'remote-work'), 'utf8'), /remote-work/u);
+  assert.match(await readFile(accountPathForName(sandbox.paths, 'remote-personal'), 'utf8'), /remote-personal/u);
+});
+
+test('bulk push and 1Password setup configure, pull, and select a profile without scripts', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+  await writeAccount(sandbox.paths, 'gi', `${JSON.stringify({ account: 'gi', source: 'local' })}\n`);
+  await writeAccount(sandbox.paths, 'personal', `${JSON.stringify({ account: 'personal', source: 'local' })}\n`);
+
+  const pushed = await syncPushAllAccounts({ paths: sandbox.paths, env: sandbox.env });
+  assert.deepEqual(pushed.map((entry) => entry.account), ['gi', 'personal']);
+
+  const freshRoot = await mkdtemp(join(tmpdir(), 'cx-remote-fresh-'));
+  t.after(async () => {
+    await rm(freshRoot, { recursive: true, force: true });
+  });
+  const freshEnv = { ...sandbox.env, CODEX_HOME: join(freshRoot, 'codex') };
+  const freshPaths = getCodexPaths(freshEnv);
+
+  const setup = await setupOnePasswordProfiles({
+    vault: 'Dev',
+    pull: true,
+    use: 'gi',
+  }, { paths: freshPaths, env: freshEnv });
+
+  assert.equal(setup.remoteConfigured, true);
+  assert.equal(setup.opAvailable, true);
+  assert.deepEqual(setup.remoteAccounts, ['gi', 'personal']);
+  assert.deepEqual(setup.pulledAccounts, ['gi', 'personal']);
+  assert.equal(setup.usedAccount, 'gi');
+  assert.equal((await readFile(join(freshPaths.home, '.current-account'), 'utf8')).trim(), 'gi');
+});
+
+test('CLI 1Password setup and --all sync make remote-backed profiles native on a fresh machine', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+  await writeAccount(sandbox.paths, 'gi', `${JSON.stringify({ account: 'gi', source: 'local' })}\n`);
+  await writeAccount(sandbox.paths, 'personal', `${JSON.stringify({ account: 'personal', source: 'local' })}\n`);
+
+  const pushed = runCli(['sync', 'push', '--all'], sandbox.env);
+  assert.equal(pushed.status, 0, pushed.stderr);
+  assert.match(pushed.stdout, /pushed profiles: gi, personal/u);
+
+  const freshRoot = await mkdtemp(join(tmpdir(), 'cx-cli-1password-'));
+  t.after(async () => {
+    await rm(freshRoot, { recursive: true, force: true });
+  });
+  const freshEnv = { ...sandbox.env, CODEX_HOME: join(freshRoot, 'codex') };
+  const freshPaths = getCodexPaths(freshEnv);
+
+  const setup = runCli(['1password', 'setup', '--vault', 'Dev', '--pull', '--use', 'gi'], freshEnv);
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.match(setup.stdout, /configured 1Password-backed Codex profiles/u);
+  assert.match(setup.stdout, /remote profiles: gi, personal/u);
+  assert.match(setup.stdout, /pulled profiles: gi, personal/u);
+  assert.equal((await readFile(join(freshPaths.home, '.current-account'), 'utf8')).trim(), 'gi');
+
+  await rm(accountPathForName(freshPaths, 'personal'));
+  const useRemoteOnly = runCli(['use', 'personal'], freshEnv);
+  assert.equal(useRemoteOnly.status, 0, useRemoteOnly.stderr);
+  assert.match(useRemoteOnly.stdout, /pulled 1Password-backed profile 'personal'/u);
+  assert.equal((await readFile(join(freshPaths.home, '.current-account'), 'utf8')).trim(), 'personal');
 });
 
 test('CLI remote and sync status do not print auth JSON contents', async (t) => {

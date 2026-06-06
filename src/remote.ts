@@ -17,6 +17,7 @@ import {
   getCodexPaths,
   listAccountNames,
   resolveExecutable,
+  useAccount,
   validateAccountName,
   writebackCurrentAccount,
   type CodexPaths,
@@ -111,6 +112,23 @@ export interface SyncStatus {
   readonly opAvailable: boolean;
   readonly opPath: string | null;
   readonly accounts: readonly SyncStatusAccount[];
+}
+
+export interface SetupOnePasswordProfilesInput extends ConfigureOnePasswordRemoteInput {
+  readonly pull?: boolean;
+  readonly force?: boolean;
+  readonly use?: string;
+}
+
+export interface SetupOnePasswordProfilesResult {
+  readonly configPath: string;
+  readonly remoteConfigured: boolean;
+  readonly opAvailable: boolean;
+  readonly vault: string;
+  readonly itemPrefix: string;
+  readonly remoteAccounts: readonly string[];
+  readonly pulledAccounts: readonly string[];
+  readonly usedAccount: string | null;
 }
 
 interface OpResult {
@@ -415,6 +433,68 @@ function itemTitle(config: RemoteConfig, account: string): string {
   return `${config.itemPrefix}${account}`;
 }
 
+function accountNameFromItemTitle(config: RemoteConfig, title: string): string | null {
+  if (!title.startsWith(config.itemPrefix)) {
+    return null;
+  }
+  const account = title.slice(config.itemPrefix.length);
+  try {
+    const safeAccount = validateAccountName(account);
+    return safeAccount === 'default' ? null : safeAccount;
+  } catch {
+    return null;
+  }
+}
+
+function sortedUnique(values: Iterable<string>): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+function parseOnePasswordItemTitles(stdout: string, action: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout) as unknown;
+  } catch (error) {
+    throw new CxError(`1Password item list JSON could not be parsed while ${action}: ${errorMessage(error)}`, 1);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new CxError(`1Password item list did not return an array while ${action}`, 1);
+  }
+  return parsed
+    .map((item) => (isRecord(item) && typeof item.title === 'string' ? item.title : null))
+    .filter((title): title is string => title !== null);
+}
+
+async function listOnePasswordAccountNames(
+  config: RemoteConfig,
+  env: NodeJS.ProcessEnv,
+): Promise<string[]> {
+  const result = await runOp([
+    'item',
+    'list',
+    '--vault',
+    config.vault,
+    '--format',
+    'json',
+  ], env, `listing 1Password items in vault '${config.vault}'`);
+
+  return sortedUnique(
+    parseOnePasswordItemTitles(result.stdout, `listing 1Password items in vault '${config.vault}'`)
+      .map((title) => accountNameFromItemTitle(config, title))
+      .filter((account): account is string => account !== null),
+  );
+}
+
+async function verifyOnePasswordVault(config: RemoteConfig, env: NodeJS.ProcessEnv): Promise<void> {
+  await runOp([
+    'vault',
+    'get',
+    config.vault,
+    '--format',
+    'json',
+  ], env, `checking 1Password vault '${config.vault}'`);
+}
+
 function validateRemoteSyncAccountName(account: string): string {
   const safeAccount = validateAccountName(account);
   if (safeAccount === 'default') {
@@ -685,6 +765,73 @@ export async function syncPullAccount(
   };
 }
 
+export async function listRemoteAccountNames(options: RemoteCliOptions = {}): Promise<string[]> {
+  const env = options.env ?? process.env;
+  const paths = remotePaths(options);
+  const config = await requireRemoteConfig({ paths });
+  return await listOnePasswordAccountNames(config, env);
+}
+
+export async function syncPullAllAccounts(options: RemoteForceOptions = {}): Promise<SyncPullResult[]> {
+  const paths = remotePaths(options);
+  const accounts = await listRemoteAccountNames(options);
+  const results: SyncPullResult[] = [];
+  for (const account of accounts) {
+    const accountFile = accountPathForName(paths, account);
+    if (options.force !== true && await pathExists(accountFile)) {
+      continue;
+    }
+    results.push(await syncPullAccount(account, options));
+  }
+  return results;
+}
+
+export async function syncPushAllAccounts(options: RemoteCliOptions = {}): Promise<SyncPushResult[]> {
+  const paths = remotePaths(options);
+  const accounts = await listRemoteSyncAccountNames(paths);
+  const results: SyncPushResult[] = [];
+  for (const account of accounts) {
+    results.push(await syncPushAccount(account, options));
+  }
+  return results;
+}
+
+export async function setupOnePasswordProfiles(
+  input: SetupOnePasswordProfilesInput,
+  options: RemoteCliOptions = {},
+): Promise<SetupOnePasswordProfilesResult> {
+  const env = options.env ?? process.env;
+  const paths = remotePaths(options);
+  const configured = await configureOnePasswordRemote(input, { paths });
+  await verifyOnePasswordVault(configured.config, env);
+  const remoteAccounts = await listOnePasswordAccountNames(configured.config, env);
+  const pulled = input.pull === true
+    ? await syncPullAllAccounts({ paths, env, force: input.force })
+    : [];
+  let usedAccount: string | null = null;
+
+  if (input.use) {
+    const account = validateRemoteSyncAccountName(input.use);
+    const accountFile = accountPathForName(paths, account);
+    if (!await pathExists(accountFile)) {
+      await syncPullAccount(account, { paths, env, force: input.force });
+    }
+    await useAccount(account, { paths });
+    usedAccount = account;
+  }
+
+  return {
+    configPath: configured.configPath,
+    remoteConfigured: true,
+    opAvailable: true,
+    vault: configured.config.vault,
+    itemPrefix: configured.config.itemPrefix,
+    remoteAccounts,
+    pulledAccounts: pulled.map((entry) => entry.account),
+    usedAccount,
+  };
+}
+
 export async function inspectSyncStatus(
   account?: string,
   options: RemoteCliOptions = {},
@@ -693,8 +840,16 @@ export async function inspectSyncStatus(
   const paths = remotePaths(options);
   const config = await readRemoteConfig({ paths });
   const opPath = await resolveExecutable('op', env);
-  const accounts = account ? [validateRemoteSyncAccountName(account)] : await listRemoteSyncAccountNames(paths);
+  let accounts = account ? [validateRemoteSyncAccountName(account)] : await listRemoteSyncAccountNames(paths);
   const statuses: SyncStatusAccount[] = [];
+
+  if (!account && config && opPath) {
+    try {
+      accounts = sortedUnique([...accounts, ...await listOnePasswordAccountNames(config, env)]);
+    } catch {
+      // Keep local status useful; per-account remote errors are reported below.
+    }
+  }
 
   for (const accountName of accounts) {
     const accountFile = accountPathForName(paths, accountName);

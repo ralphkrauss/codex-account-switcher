@@ -41,8 +41,12 @@ export {
   getRemoteConfigPath,
   inspectRemoteStatus,
   inspectSyncStatus,
+  listRemoteAccountNames,
   readRemoteConfig,
+  setupOnePasswordProfiles,
+  syncPullAllAccounts,
   syncPullAccount,
+  syncPushAllAccounts,
   syncPushAccount,
 } from './remote.js';
 
@@ -80,6 +84,8 @@ export type {
   RemotePathOptions,
   RemotePresence,
   RemoteStatus,
+  SetupOnePasswordProfilesInput,
+  SetupOnePasswordProfilesResult,
   SyncPullResult,
   SyncPushResult,
   SyncStatus,

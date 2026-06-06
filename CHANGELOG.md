@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.6 - 2026-06-06
+
+### Added
+
+- Add native `cx 1password setup` for one-command 1Password-backed profile setup, vault verification, optional bulk pull, and optional account selection.
+- Add `cx 1password status` as a friendly status alias for local/remote profile presence.
+- Add `cx sync push --all` and `cx sync pull --all` for bulk profile syncing.
+- Treat remote-only 1Password items as first-class profiles in `cx sync status`.
+
+### Changed
+
+- `cx use <account>`, `cx run <account> -- ...`, and the backward-compatible `cx <account> ...` form now auto-pull a missing local profile from configured 1Password sync before switching.
+
 ## 0.1.5 - 2026-06-06
 
 ### Fixed

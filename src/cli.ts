@@ -17,9 +17,12 @@ import {
   renameAccount,
   runCodex,
   saveAccount,
+  setupOnePasswordProfiles,
   syncHermesAccount,
   syncPullAccount,
+  syncPullAllAccounts,
   syncPushAccount,
+  syncPushAllAccounts,
   useAccount,
   useHermesAccount,
   validateAccountName,
@@ -32,6 +35,7 @@ import {
 
 const PACKAGE_NAME = '@ralphkrauss/codex-account-switcher';
 const SUBCOMMANDS = new Set([
+  '1password',
   'doctor',
   'hermes',
   'help',
@@ -79,6 +83,12 @@ interface ParsedRemoteConfigureArgs {
   readonly itemPrefix?: string;
 }
 
+interface ParsedOnePasswordSetupArgs extends ParsedRemoteConfigureArgs {
+  readonly pull: boolean;
+  readonly force: boolean;
+  readonly use?: string;
+}
+
 function write(stream: NodeJS.WritableStream, text: string): void {
   stream.write(text.endsWith('\n') ? text : `${text}\n`);
 }
@@ -112,10 +122,12 @@ Usage:
   cx hermes use <account> [--profile <name>] [--no-config]
   cx hermes sync <account> [--profile <name>]
   cx hermes status [--profile <name>] [--json]
+  cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]
+  cx 1password status [--json]
   cx remote configure 1password --vault <vault> [--item-prefix <prefix>]
   cx remote status [--json]
-  cx sync push <account>
-  cx sync pull <account> [--force]
+  cx sync push <account>|--all
+  cx sync pull <account>|--all [--force]
   cx sync status [account] [--json]
   cx doctor [--json]
   cx --help
@@ -164,15 +176,32 @@ Notes:
   The default 1Password item prefix is cx-. Token contents are never printed.`;
 }
 
+function onePasswordHelpText(): string {
+  return `Usage:
+  cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]
+  cx 1password status [--json]
+
+Commands:
+  setup   Configure 1Password as the native profile backend, verify op/vault access,
+          optionally pull all remote profiles, and optionally select one profile.
+  status  Show 1Password backend status and local/remote profile presence.
+
+Examples:
+  cx 1password setup --vault Private --pull --use gi
+  cx 1password setup --vault Private --item-prefix codex-`;
+}
+
 function syncHelpText(): string {
   return `Usage:
-  cx sync push <account>
-  cx sync pull <account> [--force]
+  cx sync push <account>|--all
+  cx sync pull <account>|--all [--force]
   cx sync status [account] [--json]
 
 Commands:
   push    Upsert CODEX_HOME/accounts/<account>.json into the configured 1Password item.
+          With --all, push every local named account except reserved default.
   pull    Read the configured 1Password item into CODEX_HOME/accounts/<account>.json.
+          With --all, pull every remote 1Password-backed profile not already local.
           Refuses to overwrite unless --force is passed.
   status  Compare local account-file presence with remote item presence without printing tokens.`;
 }
@@ -275,6 +304,62 @@ function parseRemoteConfigureArgs(args: readonly string[]): ParsedRemoteConfigur
     throw new CxError('usage: cx remote configure 1password --vault <vault> [--item-prefix <prefix>]', 2);
   }
   return { vault, ...(itemPrefix ? { itemPrefix } : {}) };
+}
+
+function parseOnePasswordSetupArgs(args: readonly string[]): ParsedOnePasswordSetupArgs {
+  let vault: string | undefined;
+  let itemPrefix: string | undefined;
+  let pull = false;
+  let force = false;
+  let use: string | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index] ?? '';
+    if (arg === '--vault') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        throw new CxError('usage: cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]', 2);
+      }
+      vault = value;
+      index += 1;
+      continue;
+    }
+    if (arg === '--item-prefix') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        throw new CxError('usage: cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]', 2);
+      }
+      itemPrefix = value;
+      index += 1;
+      continue;
+    }
+    if (arg === '--pull') {
+      pull = true;
+      continue;
+    }
+    if (arg === '--force') {
+      force = true;
+      continue;
+    }
+    if (arg === '--use') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        throw new CxError('usage: cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]', 2);
+      }
+      use = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      throw new CxError(`unknown option '${arg}'`, 2);
+    }
+    throw new CxError('usage: cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]', 2);
+  }
+
+  if (!vault) {
+    throw new CxError('usage: cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]', 2);
+  }
+  return { vault, pull, force, ...(itemPrefix ? { itemPrefix } : {}), ...(use ? { use } : {}) };
 }
 
 function parseLoginArgs(args: readonly string[]): ParsedLoginArgs {
@@ -473,6 +558,26 @@ async function printList(io: CliIo, env: NodeJS.ProcessEnv): Promise<void> {
   write(io.stdout, formatAccounts(await listAccounts(getCodexPaths(env))));
 }
 
+async function useAccountWithRemoteFallback(name: string, env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
+  const paths = getCodexPaths(env);
+  try {
+    await useAccount(name, { paths });
+    return;
+  } catch (error) {
+    if (!(error instanceof CxError) || !error.message.includes(`no account '${name}'`)) {
+      throw error;
+    }
+
+    try {
+      const pulled = await syncPullAccount(name, { env, paths });
+      write(io.stdout, `pulled 1Password-backed profile '${pulled.account}'`);
+      await useAccount(name, { paths });
+    } catch {
+      throw error;
+    }
+  }
+}
+
 function parseRunArgs(args: readonly string[]): { account: string | null; codexArgs: readonly string[] } {
   const separatorIndex = args.indexOf('--');
   if (separatorIndex >= 0) {
@@ -591,6 +696,48 @@ async function handleRemoteCommand(
   }
 }
 
+async function handleOnePasswordCommand(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  io: CliIo,
+): Promise<number> {
+  const [command, ...rest] = args;
+  if (!command || command === 'help' || command === '--help' || command === '-h') {
+    write(io.stdout, onePasswordHelpText());
+    return 0;
+  }
+
+  switch (command) {
+    case 'setup': {
+      const parsed = parseOnePasswordSetupArgs(rest);
+      const result = await setupOnePasswordProfiles(parsed, { env, paths: getCodexPaths(env) });
+      write(io.stdout, 'configured 1Password-backed Codex profiles');
+      write(io.stdout, `config: ${result.configPath}`);
+      write(io.stdout, `vault: ${result.vault}`);
+      write(io.stdout, `item prefix: ${result.itemPrefix}`);
+      write(io.stdout, `remote profiles: ${result.remoteAccounts.length > 0 ? result.remoteAccounts.join(', ') : '(none)'}`);
+      if (parsed.pull) {
+        write(io.stdout, `pulled profiles: ${result.pulledAccounts.length > 0 ? result.pulledAccounts.join(', ') : '(none)'}`);
+      }
+      if (result.usedAccount) {
+        write(io.stdout, `active codex account: ${result.usedAccount}`);
+      }
+      return 0;
+    }
+
+    case 'status': {
+      const parsed = parseJsonArgs(rest);
+      requireArity('1password status [--json]', parsed.positionals, 0);
+      const status = await inspectSyncStatus(undefined, { env, paths: getCodexPaths(env) });
+      write(io.stdout, parsed.json ? JSON.stringify(status, null, 2) : formatSyncStatus(status));
+      return 0;
+    }
+
+    default:
+      throw new CxError(`unknown 1password command '${command}'`, 2);
+  }
+}
+
 async function handleSyncCommand(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
@@ -604,7 +751,12 @@ async function handleSyncCommand(
 
   switch (command) {
     case 'push': {
-      requireArity('sync push <account>', rest, 1);
+      requireArity('sync push <account>|--all', rest, 1);
+      if (rest[0] === '--all') {
+        const results = await syncPushAllAccounts({ env, paths: getCodexPaths(env) });
+        write(io.stdout, `pushed profiles: ${results.length > 0 ? results.map((entry) => entry.account).join(', ') : '(none)'}`);
+        return 0;
+      }
       const account = rest[0] ?? '';
       const result = await syncPushAccount(account, { env, paths: getCodexPaths(env) });
       write(io.stdout, `pushed account '${result.account}' to 1Password item '${result.item}'`);
@@ -614,13 +766,33 @@ async function handleSyncCommand(
     }
 
     case 'pull': {
-      const parsed = parseForceArgs(rest);
-      requireArity('sync pull <account> [--force]', parsed.positionals, 1);
-      const account = parsed.positionals[0] ?? '';
+      let force = false;
+      const positionals: string[] = [];
+      for (const arg of rest) {
+        if (arg === '--force') {
+          force = true;
+          continue;
+        }
+        if (arg !== '--all' && arg.startsWith('--')) {
+          throw new CxError(`unknown option '${arg}'`, 2);
+        }
+        positionals.push(arg);
+      }
+      requireArity('sync pull <account>|--all [--force]', positionals, 1);
+      if (positionals[0] === '--all') {
+        const results = await syncPullAllAccounts({
+          env,
+          paths: getCodexPaths(env),
+          force,
+        });
+        write(io.stdout, `pulled profiles: ${results.length > 0 ? results.map((entry) => entry.account).join(', ') : '(none)'}`);
+        return 0;
+      }
+      const account = positionals[0] ?? '';
       const result = await syncPullAccount(account, {
         env,
         paths: getCodexPaths(env),
-        force: parsed.force,
+        force,
       });
       write(io.stdout, `pulled 1Password item '${result.item}' into account '${result.account}'`);
       write(io.stdout, `account file: ${result.accountFile}`);
@@ -682,7 +854,7 @@ export async function main(
     }
 
     validateAccountName(first);
-    await useAccount(first, { paths: getCodexPaths(env) });
+    await useAccountWithRemoteFallback(first, env, io);
     write(io.stdout, `→ codex on '${first}'`);
     return await runCodex(rest, { env });
   }
@@ -708,7 +880,7 @@ export async function main(
     case 'use': {
       requireArity('use <name>', rest, 1);
       const name = rest[0] ?? '';
-      await useAccount(name, { paths: getCodexPaths(env) });
+      await useAccountWithRemoteFallback(name, env, io);
       write(io.stdout, `active codex account: ${name}`);
       return 0;
     }
@@ -749,7 +921,7 @@ export async function main(
     case 'run': {
       const parsed = parseRunArgs(rest);
       if (parsed.account) {
-        await useAccount(parsed.account, { paths: getCodexPaths(env) });
+        await useAccountWithRemoteFallback(parsed.account, env, io);
         write(io.stdout, `→ codex on '${parsed.account}'`);
       }
       return await runCodex(parsed.codexArgs, { env });
@@ -767,6 +939,9 @@ export async function main(
 
     case 'hermes':
       return await handleHermesCommand(rest, env, io);
+
+    case '1password':
+      return await handleOnePasswordCommand(rest, env, io);
 
     case 'remote':
       return await handleRemoteCommand(rest, env, io);

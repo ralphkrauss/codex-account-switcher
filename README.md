@@ -46,11 +46,11 @@ cx run -- --help
 cx hermes use work
 cx hermes status
 cx hermes sync work
-cx remote configure 1password --vault Private
-cx remote status
-cx sync push work
+cx 1password setup --vault Private --pull --use work
+cx 1password status
+cx sync push --all
+cx sync pull --all
 cx sync status work
-cx sync pull work --force
 cx rename work work-prod
 cx rm work-prod
 cx doctor
@@ -101,9 +101,9 @@ cx hermes sync work                 # copy refreshed Hermes tokens back to the c
 
 `cx hermes sync` is the manual writeback path for phase 1: if Hermes refreshes the token in `~/.hermes/auth.json`, this copies that refreshed pair back into `~/.codex/accounts/<account>.json`.
 
-## 1Password remote sync
+## 1Password-backed profiles
 
-`cx` can sync saved account slots through 1Password using the 1Password CLI (`op`) as the remote backend. This is intended for moving Codex auth between machines without committing secrets to git or publishing them to npm.
+`cx` can use 1Password as a native profile backend through the 1Password CLI (`op`). This is intended for moving Codex auth between machines without committing secrets to git or publishing them to npm.
 
 Prerequisites:
 
@@ -111,38 +111,59 @@ Prerequisites:
 - Sign in first with `op signin`, or set `OP_SERVICE_ACCOUNT_TOKEN` for non-interactive hosts such as EC2.
 - Create or choose a vault where the items should live.
 
-Configure once per `CODEX_HOME`:
+Easy setup on a new machine:
+
+```bash
+cx 1password setup --vault Private --pull --use work
+```
+
+That one command:
+
+1. writes `~/.codex/remote.json` with the 1Password vault/prefix settings,
+2. verifies that `op` can access the vault,
+3. discovers remote `cx-*` profile items,
+4. pulls missing profiles locally, and
+5. selects the requested profile with `cx use`.
+
+If you do not want to pull immediately:
+
+```bash
+cx 1password setup --vault Private
+```
+
+After setup, remote-backed profiles behave naturally:
+
+```bash
+cx use work              # auto-pulls work from 1Password if it is not local yet
+cx run work -- exec ...  # also auto-pulls before launching Codex
+cx 1password status      # local + remote profile presence, no token contents
+```
+
+The legacy lower-level commands are still available:
 
 ```bash
 cx remote configure 1password --vault Private
 cx remote configure 1password --vault Private --item-prefix codex-
-```
-
-The config is written to `~/.codex/remote.json` (or `CODEX_HOME/remote.json`) with mode `0600` where supported. It stores only backend settings such as backend, vault, and item prefix; it does not store token contents.
-
-Check configuration and CLI availability:
-
-```bash
 cx remote status
-cx remote status --json
 ```
 
-Push a local account to 1Password:
+Push local profiles to 1Password:
 
 ```bash
 cx sync push work
+cx sync push --all
 ```
 
-This reads `~/.codex/accounts/work.json` and upserts it into item `<prefix>work` in the configured vault. The default prefix is `cx-`, so the default item title is `cx-work`.
-
-Pull an account onto another machine:
+Pull profiles onto another machine:
 
 ```bash
 cx sync pull work
 cx sync pull work --force
+cx sync pull --all
+cx sync pull --all --force
 ```
 
-`pull` refuses to overwrite an existing local `~/.codex/accounts/work.json` unless `--force` is passed.
+`pull --all` pulls every remote 1Password-backed profile that is not already local. Use `--force` to overwrite existing local profile slots.
 
 Compare local and remote presence without printing auth JSON:
 
@@ -154,7 +175,7 @@ cx sync status work --json
 
 Remote sync is for named account slots only. `default` is reserved as the live Codex auth target: choose which named account should be active/default on a machine with `cx use <name>`, rather than syncing a separate `default` profile.
 
-1Password storage details: `cx` shells out to `op` with argv arrays. Reads use `op item get <item> --vault <vault> --fields label=auth_json --reveal`. Writes use a `Secure Note` item with a concealed field named `auth_json` via `op item create ... --category "Secure Note" ... auth_json[concealed]=<json>` and `op item edit ... auth_json[concealed]=<json>`. Status commands only report presence/configuration and never reveal field contents.
+1Password storage details: `cx` shells out to `op` with argv arrays. Reads prefer `op item get <item> --vault <vault> --format json` and extract the concealed `auth_json` field safely for multiline JSON. Writes use a `Secure Note` item with a concealed field named `auth_json` via `op item create ... --category "Secure Note" ... auth_json[concealed]=<json>` and `op item edit ... auth_json[concealed]=<json>`. Status commands only report presence/configuration and never reveal field contents.
 
 ## Migrating from the prototype shell function
 
