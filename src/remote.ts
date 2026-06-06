@@ -466,7 +466,7 @@ async function upsertOnePasswordAuthJson(
     '--vault',
     config.vault,
     '--category',
-    'secure-note',
+    'Secure Note',
     '--title',
     item,
     authFieldAssignment(authJson),

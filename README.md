@@ -152,7 +152,7 @@ cx sync status work
 cx sync status work --json
 ```
 
-1Password storage details: `cx` shells out to `op` with argv arrays. Reads use `op item get <item> --vault <vault> --fields label=auth_json --reveal`. Writes use a secure-note item with a concealed field named `auth_json` via `op item create ... auth_json[concealed]=<json>` and `op item edit ... auth_json[concealed]=<json>`. Status commands only report presence/configuration and never reveal field contents.
+1Password storage details: `cx` shells out to `op` with argv arrays. Reads use `op item get <item> --vault <vault> --fields label=auth_json --reveal`. Writes use a `Secure Note` item with a concealed field named `auth_json` via `op item create ... --category "Secure Note" ... auth_json[concealed]=<json>` and `op item edit ... auth_json[concealed]=<json>`. Status commands only report presence/configuration and never reveal field contents.
 
 ## Migrating from the prototype shell function
 

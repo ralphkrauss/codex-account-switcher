@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 - 2026-06-06
+
+### Fixed
+
+- Use 1Password CLI's accepted `Secure Note` category label when creating remote sync items.
+
 ## 0.1.2 - 2026-06-06
 
 ### Added

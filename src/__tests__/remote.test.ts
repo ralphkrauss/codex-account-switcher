@@ -270,6 +270,8 @@ test('sync push creates and edits 1Password auth_json, and pull writes local acc
   const storeAfterUpdate = await readStore(sandbox.storeFile);
   assert.equal(storedAuthJson(storeAfterUpdate, 'Dev', 'cx-work'), secondAuth);
   assert.ok(storeAfterUpdate.calls.some((call: string[]) => call[0] === 'item' && call[1] === 'create'));
+  const createCall = storeAfterUpdate.calls.find((call: string[]) => call[0] === 'item' && call[1] === 'create') as string[] | undefined;
+  assert.equal(createCall?.[createCall.indexOf('--category') + 1], 'Secure Note');
   assert.ok(storeAfterUpdate.calls.some((call: string[]) => call[0] === 'item' && call[1] === 'edit'));
 
   await rm(accountFile);
