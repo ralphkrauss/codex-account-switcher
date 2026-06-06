@@ -24,6 +24,8 @@ function emptyStore() { return { vaults: {}, calls: [] }; }
 function load() { return existsSync(storeFile) ? JSON.parse(readFileSync(storeFile, 'utf8')) : emptyStore(); }
 function save(store) { writeFileSync(storeFile, JSON.stringify(store, null, 2) + '\\n'); }
 function option(args, name) { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; }
+function templatePath(args) { return option(args, '--template') ?? args.find((arg) => arg.startsWith('--template='))?.slice('--template='.length); }
+function fieldsFromTemplate(path) { if (!path) return null; const template = JSON.parse(readFileSync(path, 'utf8')); const fields = {}; for (const field of Array.isArray(template.fields) ? template.fields : []) if (typeof field.label === 'string' && typeof field.value === 'string') fields[field.label] = field.value; return { title: typeof template.title === 'string' ? template.title : undefined, fields }; }
 function assignment(arg) { const match = /^([^=\\[]+)(?:\\[[^\\]]+\\])?=([\\s\\S]*)$/u.exec(arg); return match ? { label: match[1], value: match[2] } : null; }
 function assignments(args) { return args.map(assignment).filter(Boolean); }
 function requestedField(args) { const raw = option(args, '--fields'); return raw?.startsWith('label=') ? raw.slice('label='.length) : raw; }
@@ -45,7 +47,7 @@ if (action === 'get') {
   fail('unsupported get shape');
 }
 if (action === 'create' || action === 'edit') {
-  const vault = option(args, '--vault'); const title = action === 'create' ? option(args, '--title') : args[2]; const fields = assignments(args);
+  const vault = option(args, '--vault'); const template = fieldsFromTemplate(templatePath(args)); const title = action === 'create' ? (option(args, '--title') ?? template?.title) : args[2]; const fields = template ? Object.entries(template.fields).map(([label, value]) => ({ label, value })) : assignments(args);
   if (!vault || !title || fields.length === 0) fail('missing arguments');
   const items = vaultItems(store, vault);
   if (action === 'create') { if (items[title]) fail('item ' + title + ' already exists'); items[title] = {}; }

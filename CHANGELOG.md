@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 - 2026-06-06
+
+### Fixed
+
+- Use private 1Password JSON templates for `auth_json` and sync metadata writes instead of passing secrets/multiline JSON as command arguments; this avoids Windows `.cmd` argument truncation and keeps credentials out of process listings.
+
 ## 0.2.1 - 2026-06-06
 
 ### Fixed

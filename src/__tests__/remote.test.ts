@@ -50,9 +50,22 @@ function option(args, name) {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : undefined;
 }
-
+function templatePath(args) {
+  return option(args, '--template') ?? args.find((arg) => arg.startsWith('--template='))?.slice('--template='.length);
+}
 function authAssignment(args) {
   return args.find((arg) => arg.startsWith('auth_json[concealed]='));
+}
+function fieldsFromTemplate(path) {
+  if (!path) return null;
+  const template = JSON.parse(readFileSync(path, 'utf8'));
+  const fields = {};
+  for (const field of Array.isArray(template.fields) ? template.fields : []) {
+    if (typeof field.label === 'string' && typeof field.value === 'string') {
+      fields[field.label] = field.value;
+    }
+  }
+  return { title: typeof template.title === 'string' ? template.title : undefined, fields };
 }
 
 function vaultItems(store, vault) {
@@ -125,16 +138,17 @@ if (action === 'get') {
 
 if (action === 'create') {
   const vault = option(args, '--vault');
-  const title = option(args, '--title');
+  const template = fieldsFromTemplate(templatePath(args));
+  const title = option(args, '--title') ?? template?.title;
   const assignment = authAssignment(args);
-  if (!vault || !title || !assignment) {
+  if (!vault || !title || (!assignment && !template)) {
     fail('missing create arguments');
   }
   const items = vaultItems(store, vault);
   if (items[title]) {
     fail('item ' + title + ' already exists');
   }
-  items[title] = { auth_json: assignment.slice('auth_json[concealed]='.length) };
+  items[title] = template ? template.fields : { auth_json: assignment.slice('auth_json[concealed]='.length) };
   save(store);
   process.stdout.write(JSON.stringify({ title, vault }));
   process.exit(0);
@@ -143,15 +157,20 @@ if (action === 'create') {
 if (action === 'edit') {
   const title = args[2];
   const vault = option(args, '--vault');
+  const template = fieldsFromTemplate(templatePath(args));
   const assignment = authAssignment(args);
-  if (!vault || !title || !assignment) {
+  if (!vault || !title || (!assignment && !template)) {
     fail('missing edit arguments');
   }
   const items = vaultItems(store, vault);
   if (!items[title]) {
     fail('item ' + title + ' not found');
   }
-  items[title].auth_json = assignment.slice('auth_json[concealed]='.length);
+  if (template) {
+    items[title] = { ...items[title], ...template.fields };
+  } else {
+    items[title].auth_json = assignment.slice('auth_json[concealed]='.length);
+  }
   save(store);
   process.stdout.write(JSON.stringify({ title, vault }));
   process.exit(0);
@@ -297,8 +316,11 @@ test('sync push creates and edits 1Password auth_json, and pull writes local acc
   assert.equal(storedAuthJson(storeAfterUpdate, 'Dev', 'cx-work'), secondAuth);
   assert.ok(storeAfterUpdate.calls.some((call: string[]) => call[0] === 'item' && call[1] === 'create'));
   const createCall = storeAfterUpdate.calls.find((call: string[]) => call[0] === 'item' && call[1] === 'create') as string[] | undefined;
-  assert.equal(createCall?.[createCall.indexOf('--category') + 1], 'Secure Note');
-  assert.ok(storeAfterUpdate.calls.some((call: string[]) => call[0] === 'item' && call[1] === 'edit'));
+  assert.ok(createCall?.includes('--template'));
+  assert.ok(!createCall?.some((arg) => arg.includes('fake-access-token') || arg.includes('fake-refresh-token') || arg.includes('auth_json[concealed]=')));
+  const editCall = storeAfterUpdate.calls.find((call: string[]) => call[0] === 'item' && call[1] === 'edit') as string[] | undefined;
+  assert.ok(editCall?.includes('--template'));
+  assert.ok(!editCall?.some((arg) => arg.includes('fake-access-token') || arg.includes('fake-refresh-token') || arg.includes('auth_json[concealed]=')));
 
   await rm(accountFile);
   const pulled = await syncPullAccount('work', { paths: sandbox.paths, env: sandbox.env });

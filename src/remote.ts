@@ -4,12 +4,14 @@ import { constants as fsConstants } from 'node:fs';
 import {
   access,
   chmod,
+  mkdtemp,
   mkdir,
   readFile,
   rename,
   rm,
   writeFile,
 } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   CxError,
@@ -249,10 +251,6 @@ async function writeFilePrivate(destination: string, contents: string): Promise<
 
 function sha256Hex(value: string): string {
   return createHash('sha256').update(value).digest('hex');
-}
-
-function metadataAssignment(metadata: RemoteAuthMetadata): string {
-  return `${REMOTE_METADATA_FIELD}=${JSON.stringify(metadata)}`;
 }
 
 function buildRemoteAuthMetadata(account: string, authJson: string): RemoteAuthMetadata {
@@ -664,8 +662,83 @@ async function onePasswordItemExists(
   throwOpFailure(`checking 1Password item '${item}'`, result);
 }
 
-function authFieldAssignment(authJson: string): string {
-  return `${ONEPASSWORD_AUTH_FIELD}[concealed]=${authJson}`;
+type OnePasswordItemTemplate = Record<string, unknown> & { fields?: unknown };
+
+function onePasswordField(label: string, type: 'CONCEALED' | 'STRING', value: string): Record<string, unknown> {
+  return { id: label, label, type, value };
+}
+
+function upsertTemplateField(
+  fields: unknown,
+  label: string,
+  type: 'CONCEALED' | 'STRING',
+  value: string,
+): Record<string, unknown>[] {
+  const existingFields = Array.isArray(fields)
+    ? fields.filter((field): field is Record<string, unknown> => isRecord(field))
+    : [];
+  let replaced = false;
+  const updated = existingFields.map((field) => {
+    if (field.label !== label && field.id !== label) {
+      return field;
+    }
+    replaced = true;
+    return { ...field, id: typeof field.id === 'string' ? field.id : label, label, type, value };
+  });
+  if (!replaced) {
+    updated.push(onePasswordField(label, type, value));
+  }
+  return updated;
+}
+
+function withAuthJsonTemplateFields(
+  template: OnePasswordItemTemplate,
+  authJson: string,
+  metadata: RemoteAuthMetadata,
+): OnePasswordItemTemplate {
+  const withAuth = upsertTemplateField(template.fields, ONEPASSWORD_AUTH_FIELD, 'CONCEALED', authJson);
+  const withMetadata = upsertTemplateField(withAuth, REMOTE_METADATA_FIELD, 'STRING', JSON.stringify(metadata));
+  return { ...template, fields: withMetadata };
+}
+
+function createOnePasswordItemTemplate(item: string, authJson: string, metadata: RemoteAuthMetadata): OnePasswordItemTemplate {
+  return withAuthJsonTemplateFields({ title: item, category: 'SECURE_NOTE' }, authJson, metadata);
+}
+
+function editOnePasswordItemTemplate(stdout: string, item: string, authJson: string, metadata: RemoteAuthMetadata): OnePasswordItemTemplate {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout) as unknown;
+  } catch (error) {
+    throw new CxError(`1Password item '${item}' JSON could not be parsed before updating it: ${errorMessage(error)}`, 1);
+  }
+  if (!isRecord(parsed)) {
+    throw new CxError(`1Password item '${item}' JSON was not an object before updating it`, 1);
+  }
+  return withAuthJsonTemplateFields(parsed, authJson, metadata);
+}
+
+async function writeOnePasswordTemplateFile(template: OnePasswordItemTemplate): Promise<{ dir: string; file: string }> {
+  const dir = await mkdtemp(join(tmpdir(), 'cx-op-template-'));
+  await chmodIfPossible(dir, 0o700);
+  const file = join(dir, 'item.json');
+  await writeFile(file, `${JSON.stringify(template, null, 2)}\n`, { mode: 0o600 });
+  await chmodIfPossible(file, 0o600);
+  return { dir, file };
+}
+
+async function runOpWithTemplate(
+  args: readonly string[],
+  template: OnePasswordItemTemplate,
+  env: NodeJS.ProcessEnv,
+  action: string,
+): Promise<OpResult> {
+  const { dir, file } = await writeOnePasswordTemplateFile(template);
+  try {
+    return await runOp([...args, '--template', file], env, action, { sensitive: true });
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 async function upsertOnePasswordAuthJson(
@@ -676,31 +749,36 @@ async function upsertOnePasswordAuthJson(
   env: NodeJS.ProcessEnv,
 ): Promise<{ operation: 'created' | 'updated'; metadata: RemoteAuthMetadata }> {
   const metadata = buildRemoteAuthMetadata(account, authJson);
-  if (await onePasswordItemExists(config, item, env)) {
-    await runOp([
+  const existing = await runOpRaw([
+    'item',
+    'get',
+    item,
+    '--vault',
+    config.vault,
+    '--format',
+    'json',
+  ], env);
+
+  if (existing.exitCode === 0) {
+    await runOpWithTemplate([
       'item',
       'edit',
       item,
       '--vault',
       config.vault,
-      authFieldAssignment(authJson),
-      metadataAssignment(metadata),
-    ], env, `updating 1Password item '${item}'`, { sensitive: true });
+    ], editOnePasswordItemTemplate(existing.stdout, item, authJson, metadata), env, `updating 1Password item '${item}'`);
     return { operation: 'updated', metadata };
   }
+  if (!looksLikeMissingItem(existing)) {
+    throwOpFailure(`checking 1Password item '${item}'`, existing);
+  }
 
-  await runOp([
+  await runOpWithTemplate([
     'item',
     'create',
     '--vault',
     config.vault,
-    '--category',
-    'Secure Note',
-    '--title',
-    item,
-    authFieldAssignment(authJson),
-    metadataAssignment(metadata),
-  ], env, `creating 1Password item '${item}'`, { sensitive: true });
+  ], createOnePasswordItemTemplate(item, authJson, metadata), env, `creating 1Password item '${item}'`);
   return { operation: 'created', metadata };
 }
 
