@@ -414,6 +414,21 @@ function itemTitle(config: RemoteConfig, account: string): string {
   return `${config.itemPrefix}${account}`;
 }
 
+function validateRemoteSyncAccountName(account: string): string {
+  const safeAccount = validateAccountName(account);
+  if (safeAccount === 'default') {
+    throw new CxError(
+      "account 'default' is reserved for the live Codex auth; sync a named account and choose the active default with 'cx use <name>'",
+      2,
+    );
+  }
+  return safeAccount;
+}
+
+async function listRemoteSyncAccountNames(paths: CodexPaths): Promise<string[]> {
+  return (await listAccountNames(paths)).filter((name) => name !== 'default');
+}
+
 async function onePasswordItemExists(
   config: RemoteConfig,
   item: string,
@@ -535,7 +550,7 @@ async function readLocalAccountAuthJson(
   account: string,
   paths: CodexPaths,
 ): Promise<{ account: string; accountFile: string; authJson: string }> {
-  const safeAccount = validateAccountName(account);
+  const safeAccount = validateRemoteSyncAccountName(account);
   const accountFile = accountPathForName(paths, safeAccount);
   let authJson: string;
   try {
@@ -599,7 +614,7 @@ export async function syncPullAccount(
   const env = options.env ?? process.env;
   const paths = remotePaths(options);
   const config = await requireRemoteConfig({ paths });
-  const safeAccount = validateAccountName(account);
+  const safeAccount = validateRemoteSyncAccountName(account);
   const item = itemTitle(config, safeAccount);
   const authJson = await readOnePasswordAuthJson(config, item, env);
   const local = await writeLocalAccountAuthJson(safeAccount, authJson, paths, options.force === true);
@@ -622,7 +637,7 @@ export async function inspectSyncStatus(
   const paths = remotePaths(options);
   const config = await readRemoteConfig({ paths });
   const opPath = await resolveExecutable('op', env);
-  const accounts = account ? [validateAccountName(account)] : await listAccountNames(paths);
+  const accounts = account ? [validateRemoteSyncAccountName(account)] : await listRemoteSyncAccountNames(paths);
   const statuses: SyncStatusAccount[] = [];
 
   for (const accountName of accounts) {

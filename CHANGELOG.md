@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 - 2026-06-06
+
+### Changed
+
+- Treat `default` as the live Codex auth target rather than a syncable remote account; remote sync now covers named account slots only.
+
 ## 0.1.3 - 2026-06-06
 
 ### Fixed

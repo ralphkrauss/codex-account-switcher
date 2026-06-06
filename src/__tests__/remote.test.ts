@@ -288,6 +288,31 @@ test('sync push creates and edits 1Password auth_json, and pull writes local acc
   assert.equal(await readFile(accountFile, 'utf8'), secondAuth);
 });
 
+test('remote sync ignores reserved default slot and rejects explicit default sync', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+  await writeAccount(sandbox.paths, 'default', `${JSON.stringify({ account: 'default' })}
+`);
+  await writeAccount(sandbox.paths, 'work', `${JSON.stringify({ account: 'work' })}
+`);
+
+  const status = await inspectSyncStatus(undefined, { paths: sandbox.paths, env: sandbox.env });
+  assert.deepEqual(status.accounts.map((entry) => entry.account), ['work']);
+
+  await assert.rejects(
+    () => syncPushAccount('default', { paths: sandbox.paths, env: sandbox.env }),
+    /reserved for the live Codex auth/u,
+  );
+  await assert.rejects(
+    () => syncPullAccount('default', { paths: sandbox.paths, env: sandbox.env }),
+    /reserved for the live Codex auth/u,
+  );
+  await assert.rejects(
+    () => inspectSyncStatus('default', { paths: sandbox.paths, env: sandbox.env }),
+    /reserved for the live Codex auth/u,
+  );
+});
+
 test('CLI remote and sync status do not print auth JSON contents', async (t) => {
   const sandbox = await makeSandbox(t);
   const secret = 'DO_NOT_PRINT_FAKE_AUTH_SECRET';
