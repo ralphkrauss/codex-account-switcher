@@ -18,6 +18,28 @@ npx -y @ralphkrauss/codex-account-switcher --help
 
 Requires Node.js 22+ and the native Codex CLI on `PATH`.
 
+## New personal device quick start
+
+If your Codex profiles already exist in 1Password, a new machine should only need:
+
+```bash
+npm install -g @openai/codex @ralphkrauss/codex-account-switcher
+op signin
+cx 1password setup --vault <VAULT_NAME> --pull --use <PROFILE_NAME>
+cx doctor
+cx 1password status
+```
+
+Example:
+
+```bash
+cx 1password setup --vault Codex --pull --use gi
+```
+
+For a copy-pasteable prompt you can give another agent, plus macOS/Windows/Linux, bootstrap, headless EC2, and troubleshooting steps, see [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md).
+
+Agent safety rule: do not paste or print `auth.json`, `accounts/*.json`, OAuth tokens, refresh tokens, or 1Password concealed-field contents. Use `cx doctor`, `cx 1password status`, `cx sync status`, and `cx ls` for verification instead.
+
 ## Data layout
 
 `cx` uses `CODEX_HOME` when set, otherwise `~/.codex`:
@@ -104,6 +126,8 @@ cx hermes sync work                 # copy refreshed Hermes tokens back to the c
 ## 1Password-backed profiles
 
 `cx` can use 1Password as a native profile backend through the 1Password CLI (`op`). This is intended for moving Codex auth between machines without committing secrets to git or publishing them to npm.
+
+Full setup documentation for personal devices and delegated agent setup is in [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md). It includes a prompt you can give your agent, OS-specific installation notes, first-machine bootstrapping, headless/service-account setup, and troubleshooting.
 
 Prerequisites:
 

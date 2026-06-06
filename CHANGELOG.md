@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7 - 2026-06-06
+
+### Added
+
+- Add `docs/AGENT_SETUP.md`, a copy-pasteable agent setup guide for installing Codex, `cx`, and 1Password-backed profiles on personal devices without exposing auth secrets.
+- Expand the README with quick-start setup steps, agent-safe verification commands, bootstrap/push guidance, and troubleshooting links.
+
 ## 0.1.6 - 2026-06-06
 
 ### Added

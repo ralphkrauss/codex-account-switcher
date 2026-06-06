@@ -1,6 +1,6 @@
 {
   "name": "@ralphkrauss/codex-account-switcher",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Safe multi-account auth.json switcher for the native Codex CLI.",
   "author": "Ralph Krauss <ralph@krauss.be>",
   "type": "module",
@@ -30,6 +30,7 @@
     "!dist/__tests__/",
     "!src/__tests__/",
     "README.md",
+    "docs/",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "SECURITY.md",
@@ -65,5 +66,8 @@
     "@types/node": "^22.15.18",
     "typescript": "^5.9.3"
   },
-  "packageManager": "pnpm@10.30.3"
+  "packageManager": "pnpm@10.30.3",
+  "directories": {
+    "doc": "docs"
+  }
 }
