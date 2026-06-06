@@ -60,7 +60,7 @@ cx ls
 cx save personal
 cx save personal --force
 cx login work
-cx login personal --device-auth
+cx login personal --force --device-auth
 cx login work -- --with-api-key
 cx use work
 cx run work -- exec "fix the tests"
@@ -104,7 +104,7 @@ Empty names, dot-only names, slashes, backslashes, spaces, unicode, and path tra
 - Writeback never recreates a deleted active slot.
 - `cx rm <active>` removes the saved slot and clears `.current-account`; it leaves live `auth.json` untouched until you switch or login.
 - `cx save` and `cx rename` refuse overwrites unless `--force` is passed.
-- `cx login <name>` forwards extra arguments to `codex login`, so headless flows such as `cx login personal --device-auth` work on remote machines.
+- `cx login <name>` forwards extra arguments to `codex login`, so headless flows such as `cx login personal --force --device-auth` work on remote machines; use `--force` when refreshing an existing saved profile.
 - `cx doctor`, `cx remote status`, and `cx sync status` never print token contents.
 
 ## Hermes integration
@@ -158,10 +158,19 @@ cx 1password setup --vault Private
 After setup, remote-backed profiles behave naturally:
 
 ```bash
-cx use work              # auto-pulls work from 1Password if it is not local yet
-cx run work -- exec ...  # also auto-pulls before launching Codex
-cx 1password status      # local + remote profile presence, no token contents
+cx use work              # auto-pulls work from 1Password when remote is newer or local is missing
+cx run work -- exec ...  # auto-pulls before launching Codex, then auto-pushes refreshed auth after Codex exits
+cx login work --force --device-auth # refreshes an existing profile and auto-pushes it to 1Password
+cx 1password status      # local + remote profile presence and sync state, no token contents
 ```
+
+The auto-sync layer is conservative:
+
+- Remote-backed credentials are tracked with non-secret SHA-256 metadata.
+- `cx` auto-pulls when the remote changed and the local copy is still at the last synced hash.
+- `cx` auto-pushes after `cx save`, `cx login`, `cx run`, and shortcut `cx <profile> ...` when the local profile changed.
+- If local and remote both changed, `cx` refuses to overwrite either side and asks for explicit conflict resolution.
+- Set `CX_AUTO_SYNC=0` to temporarily disable magic sync while keeping explicit `cx sync ...` commands available.
 
 The legacy lower-level commands are still available:
 

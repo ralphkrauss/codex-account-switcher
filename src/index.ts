@@ -37,6 +37,9 @@ export {
   ONEPASSWORD_AUTH_FIELD,
   ONEPASSWORD_BACKEND,
   REMOTE_CONFIG_VERSION,
+  REMOTE_METADATA_FIELD,
+  autoPullAccountForUse,
+  autoPushAccountIfChanged,
   configureOnePasswordRemote,
   getRemoteConfigPath,
   inspectRemoteStatus,
@@ -48,6 +51,7 @@ export {
   syncPullAccount,
   syncPushAllAccounts,
   syncPushAccount,
+  writebackAndAutoPushCurrentAccount,
 } from './remote.js';
 
 export type {
@@ -88,6 +92,7 @@ export type {
   SetupOnePasswordProfilesResult,
   SyncPullResult,
   SyncPushResult,
+  SyncState,
   SyncStatus,
   SyncStatusAccount,
 } from './remote.js';

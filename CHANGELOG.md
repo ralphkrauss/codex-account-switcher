@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0 - 2026-06-06
+
+### Added
+
+- Add magic sync for remote-backed Codex profiles: `cx use`, `cx run`, shortcut `cx <profile> ...`, `cx save`, and `cx login` now automatically pull/push through the configured remote backend when safe.
+- Add non-secret sync metadata and SHA-256 state tracking so auto-sync can detect `in-sync`, `remote-newer`, `local-newer`, `diverged`, and `unknown` states without printing auth JSON.
+- Add `CX_AUTO_SYNC=0` / `CX_MAGIC_SYNC=0` / `CX_NO_MAGIC_SYNC=1` opt-outs for debugging or manual sync workflows.
+
+### Changed
+
+- `cx sync status` now reports sync state in addition to local/remote presence.
+- Legacy 1Password items without metadata remain pullable and are upgraded with metadata on the next push.
+
+### Fixed
+
+- Auto-sync refuses to overwrite diverged local and remote credentials; users must resolve conflicts with explicit sync commands.
+- Implicit magic sync skips the reserved local `default` account so backwards-compatible local `cx save/use default` workflows are not broken by remote config.
+- Active-profile auto-pull now writes back refreshed live auth first, so unsaved local refreshes become conflicts instead of being overwritten by remote changes.
+- Remote metadata hashes are verified against the actual remote `auth_json`; stale or mismatched metadata is treated conservatively instead of trusted for auto-sync decisions.
+- Auto-push reports diverged local/remote credentials instead of silently skipping after `cx save`, `cx login`, or post-run writeback.
+- Auto-push no longer recreates a previously synced remote item that was deleted; explicit `cx sync push <profile>` is required for deliberate recreation.
+
 ## 0.1.8 - 2026-06-06
 
 ### Fixed

@@ -5,6 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CxError,
   authFileExists,
+  autoPullAccountForUse,
+  autoPushAccountIfChanged,
   configureOnePasswordRemote,
   getCodexPaths,
   inspectHermesStatus,
@@ -13,6 +15,7 @@ import {
   inspectSyncStatus,
   listAccounts,
   loginAccount,
+  readCurrentMarker,
   removeAccount,
   renameAccount,
   runCodex,
@@ -26,6 +29,8 @@ import {
   useAccount,
   useHermesAccount,
   validateAccountName,
+  writebackCurrentAccount,
+  writebackAndAutoPushCurrentAccount,
   type AccountList,
   type DoctorReport,
   type HermesStatus,
@@ -547,7 +552,10 @@ function formatSyncStatus(status: SyncStatus): string {
 
   lines.push('accounts:');
   for (const account of status.accounts) {
-    lines.push(`  - ${account.account}: local=${account.local.exists ? 'present' : 'missing'}, remote=${remotePresenceText(account)}`);
+    lines.push(`  - ${account.account}: local=${account.local.exists ? 'present' : 'missing'}, remote=${remotePresenceText(account)}, sync=${account.sync.state}`);
+    if (account.sync.error) {
+      lines.push(`    sync error: ${account.sync.error}`);
+    }
     lines.push(`    file: ${account.local.file}`);
     lines.push(`    item: ${account.item ?? '(unknown)'}`);
   }
@@ -558,23 +566,59 @@ async function printList(io: CliIo, env: NodeJS.ProcessEnv): Promise<void> {
   write(io.stdout, formatAccounts(await listAccounts(getCodexPaths(env))));
 }
 
+async function maybeAutoPushCurrent(env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
+  const result = await writebackAndAutoPushCurrentAccount({ env, paths: getCodexPaths(env) });
+  if (result?.action === 'pushed') {
+    write(io.stdout, `auto-pushed profile '${result.account}'`);
+  }
+}
+
+async function maybeAutoPullCurrent(env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
+  const paths = getCodexPaths(env);
+  const current = await readCurrentMarker(paths);
+  if (current.state !== 'valid') {
+    return;
+  }
+  await writebackCurrentAccount({ paths });
+  const pull = await autoPullAccountForUse(current.name, { env, paths });
+  if (pull.action === 'pulled') {
+    await useAccount(current.name, { paths, skipWriteback: true });
+    write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
+  }
+}
+
+async function runCodexAndAutoPush(args: readonly string[], env: NodeJS.ProcessEnv, io: CliIo): Promise<number> {
+  await maybeAutoPullCurrent(env, io);
+  const exitCode = await runCodex(args, { env });
+  await maybeAutoPushCurrent(env, io);
+  return exitCode;
+}
+
+async function autoPushNamed(name: string, env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
+  const result = await autoPushAccountIfChanged(name, { env, paths: getCodexPaths(env) });
+  if (result.action === 'pushed') {
+    write(io.stdout, `auto-pushed profile '${result.account}'`);
+  }
+}
+
+function displayBackendName(backend: string | undefined): string {
+  return backend === '1password' ? '1Password' : (backend ?? 'remote');
+}
+
 async function useAccountWithRemoteFallback(name: string, env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
   const paths = getCodexPaths(env);
-  try {
-    await useAccount(name, { paths });
-    return;
-  } catch (error) {
-    if (!(error instanceof CxError) || !error.message.includes(`no account '${name}'`)) {
-      throw error;
-    }
-
-    try {
-      const pulled = await syncPullAccount(name, { env, paths });
-      write(io.stdout, `pulled 1Password-backed profile '${pulled.account}'`);
-      await useAccount(name, { paths });
-    } catch {
-      throw error;
-    }
+  const current = await readCurrentMarker(paths);
+  const wasActive = current.state === 'valid' && current.name === name;
+  if (wasActive) {
+    await writebackCurrentAccount({ paths });
+  }
+  const pull = await autoPullAccountForUse(name, { env, paths });
+  if (pull.action === 'pulled') {
+    write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
+  }
+  const writeback = await useAccount(name, { paths, skipWriteback: wasActive && pull.action === 'pulled' });
+  if (writeback.performed && writeback.account) {
+    await autoPushNamed(writeback.account, env, io);
   }
 }
 
@@ -836,7 +880,7 @@ export async function main(
   if (!first) {
     const paths = getCodexPaths(env);
     if (await authFileExists(paths)) {
-      return await runCodex([], { env });
+      return await runCodexAndAutoPush([], env, io);
     }
 
     write(io.stdout, helpText(metadata));
@@ -856,7 +900,7 @@ export async function main(
     validateAccountName(first);
     await useAccountWithRemoteFallback(first, env, io);
     write(io.stdout, `→ codex on '${first}'`);
-    return await runCodex(rest, { env });
+    return await runCodexAndAutoPush(rest, env, io);
   }
 
   switch (first) {
@@ -874,6 +918,7 @@ export async function main(
       const name = parsed.positionals[0] ?? '';
       await saveAccount(name, { force: parsed.force, paths: getCodexPaths(env) });
       write(io.stdout, `saved current login as '${name}'`);
+      await autoPushNamed(name, env, io);
       return 0;
     }
 
@@ -887,13 +932,17 @@ export async function main(
 
     case 'login': {
       const parsed = parseLoginArgs(rest);
-      await loginAccount(parsed.name, {
+      const writeback = await loginAccount(parsed.name, {
         force: parsed.force,
         loginArgs: parsed.loginArgs,
         env,
         paths: getCodexPaths(env),
       });
       write(io.stdout, `logged in and saved as '${parsed.name}'`);
+      if (writeback.performed && writeback.account) {
+        await autoPushNamed(writeback.account, env, io);
+      }
+      await autoPushNamed(parsed.name, env, io);
       return 0;
     }
 
@@ -924,7 +973,7 @@ export async function main(
         await useAccountWithRemoteFallback(parsed.account, env, io);
         write(io.stdout, `→ codex on '${parsed.account}'`);
       }
-      return await runCodex(parsed.codexArgs, { env });
+      return await runCodexAndAutoPush(parsed.codexArgs, env, io);
     }
 
     case 'doctor': {

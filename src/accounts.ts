@@ -34,6 +34,7 @@ export interface CodexPaths {
 
 export interface OperationOptions {
   readonly paths?: CodexPaths;
+  readonly skipWriteback?: boolean;
 }
 
 export interface ForceOptions extends OperationOptions {
@@ -354,7 +355,15 @@ export async function writebackCurrentAccount(options: OperationOptions = {}): P
     return { performed: false, reason: 'live auth.json is missing or too small', account: current.name };
   }
 
-  await copyFilePrivate(paths.authFile, slot);
+  let liveAuthJson: string;
+  try {
+    liveAuthJson = await readFile(paths.authFile, 'utf8');
+    JSON.parse(liveAuthJson) as unknown;
+  } catch {
+    return { performed: false, reason: 'live auth.json is not valid JSON', account: current.name };
+  }
+
+  await writeFilePrivate(slot, liveAuthJson);
   return { performed: true, account: current.name };
 }
 
@@ -384,7 +393,9 @@ export async function useAccount(name: string, options: OperationOptions = {}): 
     throw new CxError(`no account '${safeName}'`, 1);
   }
 
-  const writeback = await writebackCurrentAccount({ paths });
+  const writeback = options.skipWriteback === true
+    ? { performed: false, reason: 'writeback skipped by caller' }
+    : await writebackCurrentAccount({ paths });
   await copyFilePrivate(source, paths.authFile);
   await writeCurrentMarker(paths, safeName);
   return writeback;

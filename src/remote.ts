@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import {
   access,
@@ -28,6 +28,8 @@ export const REMOTE_CONFIG_VERSION = 1;
 export const DEFAULT_ONEPASSWORD_ITEM_PREFIX = 'cx-';
 export const ONEPASSWORD_BACKEND = '1password';
 export const ONEPASSWORD_AUTH_FIELD = 'auth_json';
+export const REMOTE_METADATA_FIELD = 'cx_metadata';
+export const LOCAL_SYNC_METADATA_VERSION = 1;
 
 export type RemoteBackend = typeof ONEPASSWORD_BACKEND;
 export type RemotePresence = 'present' | 'missing' | 'unknown';
@@ -91,6 +93,8 @@ export interface SyncPullResult {
   readonly overwritten: boolean;
 }
 
+export type SyncState = 'in-sync' | 'local-newer' | 'remote-newer' | 'diverged' | 'unknown';
+
 export interface SyncStatusAccount {
   readonly account: string;
   readonly item: string | null;
@@ -102,6 +106,38 @@ export interface SyncStatusAccount {
     readonly presence: RemotePresence;
     readonly error: string | null;
   };
+  readonly sync: {
+    readonly state: SyncState;
+    readonly error: string | null;
+  };
+}
+
+export interface RemoteAuthMetadata {
+  readonly version: 1;
+  readonly account: string;
+  readonly authJsonSha256: string;
+  readonly updatedAt: string;
+  readonly deviceId?: string;
+}
+
+export interface LocalSyncMetadata {
+  readonly version: typeof LOCAL_SYNC_METADATA_VERSION;
+  readonly backend: RemoteBackend;
+  readonly account: string;
+  readonly vault?: string;
+  readonly item?: string;
+  readonly remoteAuthJsonSha256: string;
+  readonly lastSyncedAuthJsonSha256: string;
+  readonly lastSyncedAt: string;
+  readonly deviceId: string;
+}
+
+export interface AutoSyncResult {
+  readonly action: 'pulled' | 'pushed' | 'skipped';
+  readonly account: string;
+  readonly reason?: string;
+  readonly item?: string;
+  readonly backend?: RemoteBackend;
 }
 
 export interface SyncStatus {
@@ -209,6 +245,98 @@ async function writeFilePrivate(destination: string, contents: string): Promise<
     await rm(temp, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function metadataAssignment(metadata: RemoteAuthMetadata): string {
+  return `${REMOTE_METADATA_FIELD}=${JSON.stringify(metadata)}`;
+}
+
+function buildRemoteAuthMetadata(account: string, authJson: string): RemoteAuthMetadata {
+  return {
+    version: 1,
+    account,
+    authJsonSha256: sha256Hex(authJson),
+    updatedAt: new Date().toISOString(),
+    deviceId: getLocalDeviceId(),
+  };
+}
+
+function getLocalDeviceId(): string {
+  const key = 'CX_DEVICE_ID';
+  const existing = process.env[key];
+  if (existing && existing.trim().length > 0) {
+    return existing.trim();
+  }
+  return randomUUID();
+}
+
+function getLocalSyncMetadataPath(paths: CodexPaths, account: string): string {
+  return join(paths.accountsDir, '.sync', `${validateAccountName(account)}.json`);
+}
+
+async function readLocalSyncMetadata(paths: CodexPaths, account: string): Promise<LocalSyncMetadata | null> {
+  let raw: string;
+  try {
+    raw = await readFile(getLocalSyncMetadataPath(paths, account), 'utf8');
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return null;
+    }
+    throw error;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)
+      || parsed.version !== LOCAL_SYNC_METADATA_VERSION
+      || parsed.backend !== ONEPASSWORD_BACKEND
+      || parsed.account !== account
+      || typeof parsed.remoteAuthJsonSha256 !== 'string'
+      || typeof parsed.lastSyncedAuthJsonSha256 !== 'string'
+      || typeof parsed.lastSyncedAt !== 'string'
+      || typeof parsed.deviceId !== 'string') {
+      return null;
+    }
+    return {
+      version: LOCAL_SYNC_METADATA_VERSION,
+      backend: ONEPASSWORD_BACKEND,
+      account,
+      ...(typeof parsed.vault === 'string' ? { vault: parsed.vault } : {}),
+      ...(typeof parsed.item === 'string' ? { item: parsed.item } : {}),
+      remoteAuthJsonSha256: parsed.remoteAuthJsonSha256,
+      lastSyncedAuthJsonSha256: parsed.lastSyncedAuthJsonSha256,
+      lastSyncedAt: parsed.lastSyncedAt,
+      deviceId: parsed.deviceId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeLocalSyncMetadata(
+  paths: CodexPaths,
+  config: RemoteConfig,
+  account: string,
+  authJson: string,
+  remoteMetadata?: RemoteAuthMetadata | null,
+): Promise<void> {
+  const hash = sha256Hex(authJson);
+  const metadata: LocalSyncMetadata = {
+    version: LOCAL_SYNC_METADATA_VERSION,
+    backend: config.backend,
+    account,
+    vault: config.vault,
+    item: itemTitle(config, account),
+    remoteAuthJsonSha256: remoteMetadata?.authJsonSha256 ?? hash,
+    lastSyncedAuthJsonSha256: hash,
+    lastSyncedAt: new Date().toISOString(),
+    deviceId: getLocalDeviceId(),
+  };
+  await writeFilePrivate(getLocalSyncMetadataPath(paths, account), `${JSON.stringify(metadata, null, 2)}\n`);
 }
 
 function remotePaths(options: RemotePathOptions & { readonly env?: NodeJS.ProcessEnv } = {}): CodexPaths {
@@ -542,9 +670,11 @@ function authFieldAssignment(authJson: string): string {
 async function upsertOnePasswordAuthJson(
   config: RemoteConfig,
   item: string,
+  account: string,
   authJson: string,
   env: NodeJS.ProcessEnv,
-): Promise<'created' | 'updated'> {
+): Promise<{ operation: 'created' | 'updated'; metadata: RemoteAuthMetadata }> {
+  const metadata = buildRemoteAuthMetadata(account, authJson);
   if (await onePasswordItemExists(config, item, env)) {
     await runOp([
       'item',
@@ -553,8 +683,9 @@ async function upsertOnePasswordAuthJson(
       '--vault',
       config.vault,
       authFieldAssignment(authJson),
+      metadataAssignment(metadata),
     ], env, `updating 1Password item '${item}'`, { sensitive: true });
-    return 'updated';
+    return { operation: 'updated', metadata };
   }
 
   await runOp([
@@ -567,8 +698,9 @@ async function upsertOnePasswordAuthJson(
     '--title',
     item,
     authFieldAssignment(authJson),
+    metadataAssignment(metadata),
   ], env, `creating 1Password item '${item}'`, { sensitive: true });
-  return 'created';
+  return { operation: 'created', metadata };
 }
 
 function stripOneTrailingLineEnding(value: string): string {
@@ -600,7 +732,36 @@ function decodeAuthJsonField(stdout: string, item: string): string {
   }
 }
 
+function parseRemoteAuthMetadata(value: unknown): RemoteAuthMetadata | null {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!isRecord(parsed)
+      || parsed.version !== 1
+      || typeof parsed.account !== 'string'
+      || typeof parsed.authJsonSha256 !== 'string'
+      || typeof parsed.updatedAt !== 'string') {
+      return null;
+    }
+    return {
+      version: 1,
+      account: parsed.account,
+      authJsonSha256: parsed.authJsonSha256,
+      updatedAt: parsed.updatedAt,
+      ...(typeof parsed.deviceId === 'string' ? { deviceId: parsed.deviceId } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function decodeAuthJsonFieldFromItemJson(stdout: string, item: string): string {
+  return decodeOnePasswordAccountFromItemJson(stdout, item).authJson;
+}
+
+function decodeOnePasswordAccountFromItemJson(stdout: string, item: string): { authJson: string; metadata: RemoteAuthMetadata | null } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout) as unknown;
@@ -623,7 +784,14 @@ function decodeAuthJsonFieldFromItemJson(stdout: string, item: string): string {
   }
 
   parseAuthJsonString(field.value, `auth_json field in 1Password item '${item}'`);
-  return field.value;
+
+  const metadataField = parsed.fields.find((candidate: unknown): candidate is Record<string, unknown> => (
+    isRecord(candidate) && candidate.label === REMOTE_METADATA_FIELD
+  ));
+  return {
+    authJson: field.value,
+    metadata: parseRemoteAuthMetadata(metadataField?.value),
+  };
 }
 
 async function readOnePasswordAuthJson(
@@ -631,6 +799,14 @@ async function readOnePasswordAuthJson(
   item: string,
   env: NodeJS.ProcessEnv,
 ): Promise<string> {
+  return (await readOnePasswordAccount(config, item, env)).authJson;
+}
+
+async function readOnePasswordAccount(
+  config: RemoteConfig,
+  item: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ authJson: string; metadata: RemoteAuthMetadata | null }> {
   const jsonResult = await runOpRaw([
     'item',
     'get',
@@ -643,7 +819,7 @@ async function readOnePasswordAuthJson(
 
   if (jsonResult.exitCode === 0) {
     try {
-      return decodeAuthJsonFieldFromItemJson(jsonResult.stdout, item);
+      return decodeOnePasswordAccountFromItemJson(jsonResult.stdout, item);
     } catch (error) {
       if (!errorMessage(error).includes(`'${ONEPASSWORD_AUTH_FIELD}'`)) {
         throw error;
@@ -669,7 +845,7 @@ async function readOnePasswordAuthJson(
   ], env);
 
   if (fieldResult.exitCode === 0) {
-    return decodeAuthJsonField(fieldResult.stdout, item);
+    return { authJson: decodeAuthJsonField(fieldResult.stdout, item), metadata: null };
   }
   if (looksLikeMissingField(fieldResult)) {
     throw new CxError(`1Password item '${item}' does not contain a revealable '${ONEPASSWORD_AUTH_FIELD}' field`, 1);
@@ -740,7 +916,8 @@ export async function syncPushAccount(
   await writebackCurrentAccountIfSyncTarget(safeAccount, paths);
   const local = await readLocalAccountAuthJson(safeAccount, paths);
   const item = itemTitle(config, local.account);
-  const operation = await upsertOnePasswordAuthJson(config, item, local.authJson, env);
+  const upload = await upsertOnePasswordAuthJson(config, item, local.account, local.authJson, env);
+  await writeLocalSyncMetadata(paths, config, local.account, local.authJson, upload.metadata);
 
   return {
     account: local.account,
@@ -748,7 +925,7 @@ export async function syncPushAccount(
     backend: config.backend,
     vault: config.vault,
     item,
-    operation,
+    operation: upload.operation,
   };
 }
 
@@ -761,8 +938,14 @@ export async function syncPullAccount(
   const config = await requireRemoteConfig({ paths });
   const safeAccount = validateRemoteSyncAccountName(account);
   const item = itemTitle(config, safeAccount);
-  const authJson = await readOnePasswordAuthJson(config, item, env);
-  const local = await writeLocalAccountAuthJson(safeAccount, authJson, paths, options.force === true);
+  const remote = await readOnePasswordAccount(config, item, env);
+  const verifiedMetadata = remote.metadata
+    && remote.metadata.account === safeAccount
+    && remote.metadata.authJsonSha256 === sha256Hex(remote.authJson)
+    ? remote.metadata
+    : null;
+  const local = await writeLocalAccountAuthJson(safeAccount, remote.authJson, paths, options.force === true);
+  await writeLocalSyncMetadata(paths, config, safeAccount, remote.authJson, verifiedMetadata);
 
   return {
     account: local.account,
@@ -803,6 +986,199 @@ export async function syncPushAllAccounts(options: RemoteCliOptions = {}): Promi
     results.push(await syncPushAccount(account, options));
   }
   return results;
+}
+
+function autoSyncDisabled(env: NodeJS.ProcessEnv): boolean {
+  return env.CX_AUTO_SYNC === '0' || env.CX_MAGIC_SYNC === '0' || env.CX_NO_MAGIC_SYNC === '1';
+}
+
+async function readLocalAuthHash(account: string, paths: CodexPaths): Promise<string | null> {
+  try {
+    const raw = await readFile(accountPathForName(paths, account), 'utf8');
+    parseAuthJsonString(raw, `Codex account '${account}'`);
+    return sha256Hex(raw);
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function readRemoteAccountMetadata(
+  account: string,
+  config: RemoteConfig,
+  env: NodeJS.ProcessEnv,
+): Promise<{ metadata: RemoteAuthMetadata | null; authJson?: string }> {
+  const item = itemTitle(config, account);
+  const remote = await readOnePasswordAccount(config, item, env);
+  const actualHash = sha256Hex(remote.authJson);
+  const metadata = remote.metadata
+    && remote.metadata.account === account
+    && remote.metadata.authJsonSha256 === actualHash
+    ? remote.metadata
+    : null;
+  return { metadata, authJson: remote.authJson };
+}
+
+function classifyHashes(
+  localHash: string | null,
+  localMetadata: LocalSyncMetadata | null,
+  remoteMetadata: RemoteAuthMetadata | null,
+): SyncState {
+  if (!remoteMetadata || !localHash || !localMetadata) {
+    return 'unknown';
+  }
+  if (localHash === remoteMetadata.authJsonSha256) {
+    return 'in-sync';
+  }
+  const localChangedSinceSync = localHash !== localMetadata.lastSyncedAuthJsonSha256;
+  const remoteChangedSinceSync = remoteMetadata.authJsonSha256 !== localMetadata.remoteAuthJsonSha256
+    || remoteMetadata.authJsonSha256 !== localMetadata.lastSyncedAuthJsonSha256;
+  if (!localChangedSinceSync && remoteChangedSinceSync) {
+    return 'remote-newer';
+  }
+  if (localChangedSinceSync && !remoteChangedSinceSync) {
+    return 'local-newer';
+  }
+  if (localChangedSinceSync && remoteChangedSinceSync) {
+    return 'diverged';
+  }
+  return 'unknown';
+}
+
+async function inspectAccountSyncState(
+  account: string,
+  config: RemoteConfig | null,
+  env: NodeJS.ProcessEnv,
+  paths: CodexPaths,
+): Promise<{ state: SyncState; error: string | null }> {
+  if (!config) {
+    return { state: 'unknown', error: 'remote backend is not configured' };
+  }
+  try {
+    const [localHash, localMetadata, remote] = await Promise.all([
+      readLocalAuthHash(account, paths),
+      readLocalSyncMetadata(paths, account),
+      readRemoteAccountMetadata(account, config, env),
+    ]);
+    return { state: classifyHashes(localHash, localMetadata, remote.metadata), error: null };
+  } catch (error) {
+    return { state: 'unknown', error: errorMessage(error) };
+  }
+}
+
+export async function autoPullAccountForUse(
+  account: string,
+  options: RemoteCliOptions = {},
+): Promise<AutoSyncResult> {
+  const env = options.env ?? process.env;
+  const paths = remotePaths(options);
+  const safeAccount = validateAccountName(account);
+  if (safeAccount === 'default') {
+    return { action: 'skipped', account: safeAccount, reason: 'reserved default account' };
+  }
+  if (autoSyncDisabled(env)) {
+    return { action: 'skipped', account: safeAccount, reason: 'auto sync disabled' };
+  }
+  const config = await readRemoteConfig({ paths });
+  if (!config) {
+    return { action: 'skipped', account: safeAccount, reason: 'remote backend is not configured' };
+  }
+
+  const item = itemTitle(config, safeAccount);
+  const accountFile = accountPathForName(paths, safeAccount);
+  const localExists = await pathExists(accountFile);
+  if (!localExists) {
+    const pulled = await syncPullAccount(safeAccount, { env, paths });
+    return { action: 'pulled', account: pulled.account, item: pulled.item, backend: pulled.backend, reason: 'local account missing' };
+  }
+
+  const localHash = await readLocalAuthHash(safeAccount, paths);
+  const localMetadata = await readLocalSyncMetadata(paths, safeAccount);
+  const remote = await readRemoteAccountMetadata(safeAccount, config, env).catch((error: unknown) => ({
+    metadata: null,
+    error: errorMessage(error),
+  }));
+  if ('error' in remote) {
+    return { action: 'skipped', account: safeAccount, item, backend: config.backend, reason: `remote unavailable: ${remote.error}` };
+  }
+  const state = classifyHashes(localHash, localMetadata, remote.metadata);
+  if (state === 'remote-newer') {
+    const pulled = await syncPullAccount(safeAccount, { env, paths, force: true });
+    return { action: 'pulled', account: pulled.account, item: pulled.item, backend: pulled.backend, reason: 'remote newer' };
+  }
+  if (state === 'diverged') {
+    throw new CxError(`sync conflict for '${safeAccount}': local and remote credentials diverged; use 'cx sync status ${safeAccount}', then resolve with explicit 'cx sync pull ${safeAccount} --force' or 'cx sync push ${safeAccount}'`, 1);
+  }
+  return { action: 'skipped', account: safeAccount, item, backend: config.backend, reason: state };
+}
+
+export async function autoPushAccountIfChanged(
+  account: string,
+  options: RemoteCliOptions = {},
+): Promise<AutoSyncResult> {
+  const env = options.env ?? process.env;
+  const paths = remotePaths(options);
+  const safeAccount = validateAccountName(account);
+  if (safeAccount === 'default') {
+    return { action: 'skipped', account: safeAccount, reason: 'reserved default account' };
+  }
+  if (autoSyncDisabled(env)) {
+    return { action: 'skipped', account: safeAccount, reason: 'auto sync disabled' };
+  }
+  const config = await readRemoteConfig({ paths });
+  if (!config) {
+    return { action: 'skipped', account: safeAccount, reason: 'remote backend is not configured' };
+  }
+  const localHash = await readLocalAuthHash(safeAccount, paths);
+  if (!localHash) {
+    return { action: 'skipped', account: safeAccount, reason: 'local account missing' };
+  }
+  const localMetadata = await readLocalSyncMetadata(paths, safeAccount);
+  const remote = await readRemoteAccountMetadata(safeAccount, config, env).then(
+    (value) => ({ ...value, missing: false, unavailable: null as string | null }),
+    (error: unknown) => {
+      const message = errorMessage(error);
+      if (message.includes('was not found')) {
+        return { metadata: null, missing: true, unavailable: null as string | null };
+      }
+      return { metadata: null, missing: false, unavailable: message };
+    },
+  );
+  if (remote.unavailable) {
+    return { action: 'skipped', account: safeAccount, item: itemTitle(config, safeAccount), backend: config.backend, reason: `remote unavailable: ${remote.unavailable}` };
+  }
+  if (remote.missing) {
+    if (localMetadata) {
+      return { action: 'skipped', account: safeAccount, item: itemTitle(config, safeAccount), backend: config.backend, reason: 'remote missing after previous sync' };
+    }
+    const pushed = await syncPushAccount(safeAccount, { env, paths });
+    return { action: 'pushed', account: pushed.account, item: pushed.item, backend: pushed.backend, reason: 'remote missing' };
+  }
+  const state = classifyHashes(localHash, localMetadata, remote.metadata);
+  if (state === 'in-sync') {
+    return { action: 'skipped', account: safeAccount, item: itemTitle(config, safeAccount), backend: config.backend, reason: 'in-sync' };
+  }
+  if (state === 'diverged') {
+    throw new CxError(`sync conflict for '${safeAccount}': local and remote credentials diverged; use 'cx sync status ${safeAccount}', then resolve with explicit 'cx sync pull ${safeAccount} --force' or 'cx sync push ${safeAccount}'`, 1);
+  }
+  if (state !== 'local-newer') {
+    return { action: 'skipped', account: safeAccount, item: itemTitle(config, safeAccount), backend: config.backend, reason: state };
+  }
+  const pushed = await syncPushAccount(safeAccount, { env, paths });
+  return { action: 'pushed', account: pushed.account, item: pushed.item, backend: pushed.backend, reason: state };
+}
+
+export async function writebackAndAutoPushCurrentAccount(
+  options: RemoteCliOptions = {},
+): Promise<AutoSyncResult | null> {
+  const paths = remotePaths(options);
+  const writeback = await writebackCurrentAccount({ paths });
+  if (!writeback.performed || !writeback.account) {
+    return null;
+  }
+  return await autoPushAccountIfChanged(writeback.account, options);
 }
 
 export async function setupOnePasswordProfiles(
@@ -878,6 +1254,8 @@ export async function inspectSyncStatus(
       }
     }
 
+    const sync = await inspectAccountSyncState(accountName, config, env, paths);
+
     statuses.push({
       account: accountName,
       item: remoteItem,
@@ -889,6 +1267,7 @@ export async function inspectSyncStatus(
         presence,
         error: remoteError,
       },
+      sync,
     });
   }
 

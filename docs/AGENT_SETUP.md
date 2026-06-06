@@ -31,7 +31,7 @@ Tasks:
    - `cx ls`
    - `cx run <PROFILE_NAME> -- --version`
 6. If a requested profile exists in 1Password but is not local, rely on `cx use <PROFILE_NAME>` or `cx run <PROFILE_NAME> -- ...` to auto-pull it.
-7. If a profile's Codex session has ended, run `cx login <PROFILE_NAME> --device-auth`, ask me to complete the browser/device flow, then run `cx sync push <PROFILE_NAME>`.
+7. If a profile's Codex session has ended, run `cx login <PROFILE_NAME> --force --device-auth`, ask me to complete the browser/device flow, then verify with `cx sync status <PROFILE_NAME>`. The refreshed profile auto-pushes when remote sync is configured.
 
 Use `<VAULT_NAME>` for the 1Password vault that contains the `cx-*` items and `<PROFILE_NAME>` for the profile I want active, for example `gi` or `personal`.
 ```
@@ -126,7 +126,7 @@ If 1Password does not have any `cx-*` items yet, bootstrap from a machine where 
    If you need to log in a new account:
 
    ```bash
-   cx login personal --device-auth
+   cx login personal --force --device-auth
    ```
 
 2. Configure the vault.
@@ -135,7 +135,7 @@ If 1Password does not have any `cx-*` items yet, bootstrap from a machine where 
    cx 1password setup --vault <VAULT_NAME>
    ```
 
-3. Push named profiles.
+3. Push named profiles if needed. With remote sync configured, `cx save <profile>` and `cx login <profile>` auto-push safely; explicit sync remains available for bootstrapping or repair.
 
    ```bash
    cx sync push gi
@@ -201,11 +201,11 @@ Run Codex under a profile:
 cx run gi -- exec "fix the failing tests"
 ```
 
-Login or refresh a profile, then push the refreshed token to 1Password:
+Login or refresh a profile. With 1Password sync configured, `cx login` saves the refreshed credentials and auto-pushes them to the remote backend:
 
 ```bash
-cx login personal --device-auth
-cx sync push personal
+cx login personal --force --device-auth
+cx sync status personal
 ```
 
 Pull a new remote profile:
@@ -234,7 +234,9 @@ cx sync status
 - `cx use <profile>` chooses which named profile is active on that machine.
 - Do not copy `auth.json` through chat, git, shared folders, or plain text notes.
 - Do not run a fresh `cx login <profile>` on a secondary machine unless you intentionally want to rotate/replace that OAuth session. Pulling from 1Password is safer for shared profiles.
-- If Codex says a session has ended, run `cx login <profile> --device-auth` and then `cx sync push <profile>`.
+- If Codex says a session has ended, run `cx login <profile> --force --device-auth`; with remote sync configured, `cx` auto-pushes the refreshed profile. Confirm with `cx sync status <profile>`.
+- If local and remote both changed, `cx` reports a sync conflict and refuses to overwrite either side. Resolve deliberately with explicit `cx sync pull <profile> --force` or `cx sync push <profile>`.
+- To temporarily disable magic sync for debugging, set `CX_AUTO_SYNC=0`; explicit `cx sync ...` commands still work.
 
 ## Troubleshooting
 
@@ -303,14 +305,16 @@ If the live `~/.codex/auth.json` is now the refreshed profile but `cx ls` still 
 
 ```bash
 cx save <PROFILE_NAME> --force
-cx sync push <PROFILE_NAME>
+cx sync status <PROFILE_NAME>
 ```
+
+`cx save` auto-pushes when remote sync is configured. If you disabled auto-sync, run `cx sync push <PROFILE_NAME>` manually.
 
 Example:
 
 ```bash
 cx save personal --force
-cx sync push personal
+cx sync status personal
 ```
 
 Then restore/switch any other profile from 1Password if needed:

@@ -1,6 +1,6 @@
 {
   "name": "@ralphkrauss/codex-account-switcher",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "description": "Safe multi-account auth.json switcher for the native Codex CLI.",
   "author": "Ralph Krauss <ralph@krauss.be>",
   "type": "module",
