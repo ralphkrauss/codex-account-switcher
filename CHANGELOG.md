@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 - 2026-06-06
+
+### Fixed
+
+- Run Windows `.cmd`/`.bat` 1Password CLI shims through a shell so fake/test and npm-installed command shims work on Windows smoke jobs.
+
 ## 0.2.0 - 2026-06-06
 
 ### Added

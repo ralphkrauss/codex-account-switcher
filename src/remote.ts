@@ -505,10 +505,11 @@ async function runOpRaw(
   env: NodeJS.ProcessEnv,
 ): Promise<OpResult> {
   const opPath = await resolveOp(env);
+  const shell = process.platform === 'win32' && /\.(?:cmd|bat)$/iu.test(opPath);
   return await new Promise((resolvePromise, reject) => {
     const child = spawn(opPath, [...args], {
       env,
-      shell: false,
+      shell,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
