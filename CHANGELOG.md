@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2 - 2026-06-06
+
+### Added
+
+- `cx hermes use <account>` imports a saved Codex account into Hermes' `openai-codex` auth/config without forking Hermes.
+- `cx hermes sync <account>` copies refreshed Hermes Codex tokens back into the selected `cx` account slot.
+- `cx hermes status` reports Hermes Codex auth/config state without revealing token contents.
+- `cx remote configure 1password` configures a 1Password CLI (`op`) remote backend for account sync.
+- `cx sync push`, `cx sync pull`, and `cx sync status` sync saved account slots through 1Password secure-note items with a concealed `auth_json` field.
+
+### Changed
+
+- Documented Hermes bridging and 1Password remote sync workflows.
+- Expanded test coverage for Hermes auth bridging and 1Password sync using fake local credentials/`op` fixtures.
+
 ## 0.1.1 - 2026-06-04
 
 ### Added
