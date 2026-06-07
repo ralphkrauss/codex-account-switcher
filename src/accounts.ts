@@ -135,6 +135,23 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function authAccountId(parsed: unknown): string | null {
+  if (typeof parsed !== 'object' || parsed === null || !('tokens' in parsed)) {
+    return null;
+  }
+  const tokens = (parsed as { readonly tokens?: unknown }).tokens;
+  if (typeof tokens !== 'object' || tokens === null || !('account_id' in tokens)) {
+    return null;
+  }
+  const accountId = (tokens as { readonly account_id?: unknown }).account_id;
+  return typeof accountId === 'string' && accountId.length > 0 ? accountId : null;
+}
+
+function parseAuthJsonForWriteback(raw: string): { parsed: unknown; accountId: string | null } {
+  const parsed = JSON.parse(raw) as unknown;
+  return { parsed, accountId: authAccountId(parsed) };
+}
+
 async function pathExists(path: string): Promise<boolean> {
   try {
     await access(path, fsConstants.F_OK);
@@ -356,11 +373,24 @@ export async function writebackCurrentAccount(options: OperationOptions = {}): P
   }
 
   let liveAuthJson: string;
+  let liveAccountId: string | null;
   try {
     liveAuthJson = await readFile(paths.authFile, 'utf8');
-    JSON.parse(liveAuthJson) as unknown;
+    liveAccountId = parseAuthJsonForWriteback(liveAuthJson).accountId;
   } catch {
     return { performed: false, reason: 'live auth.json is not valid JSON', account: current.name };
+  }
+
+  if (liveAccountId) {
+    try {
+      const slotAuthJson = await readFile(slot, 'utf8');
+      const slotAccountId = parseAuthJsonForWriteback(slotAuthJson).accountId;
+      if (slotAccountId && slotAccountId !== liveAccountId) {
+        return { performed: false, reason: 'live auth.json account_id does not match current account slot', account: current.name };
+      }
+    } catch {
+      return { performed: false, reason: 'current account slot is not valid JSON', account: current.name };
+    }
   }
 
   await writeFilePrivate(slot, liveAuthJson);

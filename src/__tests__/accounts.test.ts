@@ -15,8 +15,9 @@ import {
   writebackCurrentAccount,
 } from '../index.js';
 
-function authPayload(label: string): string {
-  return `${JSON.stringify({ label, filler: 'x'.repeat(180) })}\n`;
+function authPayload(label: string, accountId?: string): string {
+  const tokens = accountId ? { account_id: accountId, access_token: `access-${label}`, refresh_token: `refresh-${label}` } : undefined;
+  return `${JSON.stringify({ label, ...(tokens ? { tokens } : {}), filler: 'x'.repeat(180) })}\n`;
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -40,12 +41,12 @@ test('save, list, and use preserve refreshed auth with writeback', async (t) => 
   const paths = await makeHome(t);
   await mkdir(paths.home, { recursive: true });
 
-  await writeFile(paths.authFile, authPayload('work-initial'));
+  await writeFile(paths.authFile, authPayload('work-initial', 'work-id'));
   await saveAccount('work', { paths });
 
-  await writeFile(paths.authFile, authPayload('personal-initial'));
+  await writeFile(paths.authFile, authPayload('personal-initial', 'personal-id'));
   await saveAccount('personal', { paths });
-  await writeFile(paths.authFile, authPayload('personal-refreshed'));
+  await writeFile(paths.authFile, authPayload('personal-refreshed', 'personal-id'));
 
   const writeback = await useAccount('work', { paths });
   assert.deepEqual(writeback, { performed: true, account: 'personal' });
@@ -61,6 +62,33 @@ test('save, list, and use preserve refreshed auth with writeback', async (t) => 
     assert.equal((await stat(paths.accountsDir)).mode & 0o777, 0o700);
     assert.equal((await stat(accountPathForName(paths, 'work'))).mode & 0o777, 0o600);
   }
+});
+
+test('writeback refuses to overwrite the current slot with a different Codex account_id', async (t) => {
+  const paths = await makeHome(t);
+  await mkdir(paths.home, { recursive: true });
+
+  await writeFile(paths.authFile, authPayload('gi-initial', 'gi-id'));
+  await saveAccount('gi', { paths });
+  const giBefore = await readFile(accountPathForName(paths, 'gi'), 'utf8');
+
+  await writeFile(paths.authFile, authPayload('personal-initial', 'personal-id'));
+  await saveAccount('personal', { paths });
+  await useAccount('gi', { paths });
+
+  // Simulates a raw `codex login` or other out-of-band auth mutation while
+  // .current-account still says `gi`. The next switch must not save that
+  // different OAuth account into gi.json.
+  await writeFile(paths.authFile, authPayload('personal-raw-login', 'personal-id'));
+
+  const writeback = await useAccount('personal', { paths });
+  assert.deepEqual(writeback, {
+    performed: false,
+    reason: 'live auth.json account_id does not match current account slot',
+    account: 'gi',
+  });
+  assert.equal(await readFile(accountPathForName(paths, 'gi'), 'utf8'), giBefore);
+  assert.match(await readFile(paths.authFile, 'utf8'), /personal-initial/);
 });
 
 test('save refuses to overwrite unless --force semantics are requested', async (t) => {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 - 2026-06-06
+
+### Fixed
+
+- Refuse automatic writeback when live `auth.json` has a different Codex `tokens.account_id` than the current profile slot, preventing out-of-band `codex login` or manual auth changes from making two profiles point at the same ChatGPT account.
+
 ## 0.2.2 - 2026-06-06
 
 ### Fixed
