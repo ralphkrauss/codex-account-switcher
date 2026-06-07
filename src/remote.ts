@@ -12,7 +12,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import {
   CxError,
   accountPathForName,
@@ -341,6 +341,107 @@ function remotePaths(options: RemotePathOptions & { readonly env?: NodeJS.Proces
   return options.paths ?? getCodexPaths(options.env ?? process.env);
 }
 
+const OP_ENV_KEYS = new Set(['OP_SERVICE_ACCOUNT_TOKEN']);
+const COMMON_OP_PATHS = process.platform === 'win32'
+  ? []
+  : ['/opt/homebrew/bin/op', '/usr/local/bin/op'];
+
+function homeFromEnv(env: NodeJS.ProcessEnv): string | null {
+  return env.HOME ?? env.USERPROFILE ?? null;
+}
+
+function configuredOpEnvFiles(env: NodeJS.ProcessEnv): string[] {
+  const files: string[] = [];
+  if (env.CX_OP_ENV_FILE && env.CX_OP_ENV_FILE.trim().length > 0) {
+    files.push(resolve(env.CX_OP_ENV_FILE));
+  }
+  const home = homeFromEnv(env);
+  if (home) {
+    files.push(join(home, '.config', '1password', 'op.env'));
+  }
+  return sortedUnique(files);
+}
+
+function parseEnvValue(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1);
+  }
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed
+      .slice(1, -1)
+      .replace(/\\(["\\$`])/gu, '$1');
+  }
+  return trimmed;
+}
+
+function parseOnePasswordEnvFile(contents: string): Record<string, string> {
+  const parsed: Record<string, string> = {};
+  for (const line of contents.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith('#')) {
+      continue;
+    }
+    const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u.exec(trimmed);
+    if (!match) {
+      continue;
+    }
+    const [, key, value] = match;
+    if (key && OP_ENV_KEYS.has(key)) {
+      parsed[key] = parseEnvValue(value ?? '');
+    }
+  }
+  return parsed;
+}
+
+async function loadOnePasswordServiceAccountEnv(env: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
+  if (env.OP_SERVICE_ACCOUNT_TOKEN && env.OP_SERVICE_ACCOUNT_TOKEN.trim().length > 0) {
+    return env;
+  }
+
+  for (const file of configuredOpEnvFiles(env)) {
+    let raw: string;
+    try {
+      raw = await readFile(file, 'utf8');
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        continue;
+      }
+      throw error;
+    }
+    const parsed = parseOnePasswordEnvFile(raw);
+    if (parsed.OP_SERVICE_ACCOUNT_TOKEN && parsed.OP_SERVICE_ACCOUNT_TOKEN.trim().length > 0) {
+      return { ...env, ...parsed };
+    }
+  }
+
+  return env;
+}
+
+async function resolveOpPath(env: NodeJS.ProcessEnv): Promise<string | null> {
+  const configured = env.CX_OP_PATH;
+  if (configured && configured.trim().length > 0) {
+    const resolved = await resolveExecutable(configured.trim(), env);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  const fromPath = await resolveExecutable('op', env);
+  if (fromPath) {
+    return fromPath;
+  }
+
+  for (const candidate of COMMON_OP_PATHS) {
+    const resolved = await resolveExecutable(candidate, env);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
 export function getRemoteConfigPath(paths: CodexPaths = getCodexPaths()): string {
   return join(paths.home, 'remote.json');
 }
@@ -437,7 +538,8 @@ export async function configureOnePasswordRemote(
 export async function inspectRemoteStatus(options: RemoteCliOptions = {}): Promise<RemoteStatus> {
   const paths = remotePaths(options);
   const config = await readRemoteConfig({ paths });
-  const opPath = await resolveExecutable('op', options.env ?? process.env);
+  const env = await loadOnePasswordServiceAccountEnv(options.env ?? process.env);
+  const opPath = await resolveOpPath(env);
   return {
     configPath: getRemoteConfigPath(paths),
     configured: config !== null,
@@ -457,7 +559,7 @@ function missingOpError(): CxError {
 }
 
 async function resolveOp(env: NodeJS.ProcessEnv): Promise<string> {
-  const opPath = await resolveExecutable('op', env);
+  const opPath = await resolveOpPath(env);
   if (!opPath) {
     throw missingOpError();
   }
@@ -502,11 +604,12 @@ async function runOpRaw(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
 ): Promise<OpResult> {
-  const opPath = await resolveOp(env);
+  const opEnv = await loadOnePasswordServiceAccountEnv(env);
+  const opPath = await resolveOp(opEnv);
   const shell = process.platform === 'win32' && /\.(?:cmd|bat)$/iu.test(opPath);
   return await new Promise((resolvePromise, reject) => {
     const child = spawn(opPath, [...args], {
-      env,
+      env: opEnv,
       shell,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -1300,10 +1403,10 @@ export async function inspectSyncStatus(
   account?: string,
   options: RemoteCliOptions = {},
 ): Promise<SyncStatus> {
-  const env = options.env ?? process.env;
+  const env = await loadOnePasswordServiceAccountEnv(options.env ?? process.env);
   const paths = remotePaths(options);
   const config = await readRemoteConfig({ paths });
-  const opPath = await resolveExecutable('op', env);
+  const opPath = await resolveOpPath(env);
   let accounts = account ? [validateRemoteSyncAccountName(account)] : await listRemoteSyncAccountNames(paths);
   const statuses: SyncStatusAccount[] = [];
 

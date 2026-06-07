@@ -78,6 +78,12 @@ const args = process.argv.slice(2);
 const store = load();
 store.calls.push(args);
 
+if (process.env.OP_REQUIRE_SERVICE_ACCOUNT_TOKEN === '1' && !process.env.OP_SERVICE_ACCOUNT_TOKEN) {
+  save(store);
+  console.error('missing OP_SERVICE_ACCOUNT_TOKEN');
+  process.exit(70);
+}
+
 function fail(message, code = 1) {
   save(store);
   console.error(message);
@@ -593,4 +599,44 @@ test('CLI remote and sync status do not print auth JSON contents', async (t) => 
 
   const functionStatus = await inspectSyncStatus('work', { paths: sandbox.paths, env: sandbox.env });
   assert.equal(JSON.stringify(functionStatus).includes(secret), false);
+});
+
+test('1Password commands load service account env file and configured op path', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev' }, { paths: sandbox.paths });
+
+  const opEnvDir = join(sandbox.root, '.config', '1password');
+  await mkdir(opEnvDir, { recursive: true });
+  await writeFile(join(opEnvDir, 'op.env'), "export OP_SERVICE_ACCOUNT_TOKEN='fake-service-token'\n");
+
+  const authJson = `${JSON.stringify({ tokens: { access_token: 'remote-access', refresh_token: 'remote-refresh' } }, null, 2)}\n`;
+  await writeFile(sandbox.storeFile, `${JSON.stringify({
+    vaults: {
+      Dev: {
+        'cx-work': { auth_json: authJson },
+      },
+    },
+    calls: [],
+  }, null, 2)}\n`);
+
+  const env: NodeJS.ProcessEnv = {
+    ...sandbox.env,
+    HOME: sandbox.root,
+    USERPROFILE: sandbox.root,
+    PATH: process.env.PATH ?? '',
+    CX_OP_PATH: join(sandbox.bin, process.platform === 'win32' ? 'op.cmd' : 'op'),
+    OP_REQUIRE_SERVICE_ACCOUNT_TOKEN: '1',
+  };
+  delete env.OP_SERVICE_ACCOUNT_TOKEN;
+
+  const pulled = runCli(['sync', 'pull', 'work'], env);
+  assert.equal(pulled.status, 0, pulled.stderr);
+  assert.match(pulled.stdout, /pulled 1Password item 'cx-work' into account 'work'/u);
+
+  const accountFile = accountPathForName(sandbox.paths, 'work');
+  assert.equal(await readFile(accountFile, 'utf8'), authJson);
+
+  const status = runCli(['sync', 'status', 'work'], env);
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /op CLI: available/u);
 });

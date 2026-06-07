@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.5 - 2026-06-07
+
+### Fixed
+
+- `cx` now loads `~/.config/1password/op.env` itself when `OP_SERVICE_ACCOUNT_TOKEN` is not already in the shell, so 1Password sync commands do not fall back to an interactive vault unlock prompt on fresh or existing terminals.
+- 1Password sync now discovers `op` from `CX_OP_PATH` and common Homebrew install locations (`/opt/homebrew/bin/op`, `/usr/local/bin/op`) even when the user's `PATH` does not include Homebrew.
+
 ## 0.2.4 - 2026-06-07
 
 ### Changed
