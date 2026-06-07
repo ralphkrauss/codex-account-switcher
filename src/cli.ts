@@ -159,8 +159,10 @@ function hermesHelpText(): string {
 
 Commands:
   use      Import CODEX_HOME/accounts/<account>.json into Hermes openai-codex auth.
+           If 1Password remote sync is configured, missing/remote-newer accounts auto-pull first.
            Also sets model.provider=openai-codex unless --no-config is passed.
   sync     Copy Hermes openai-codex tokens back to the cx account slot.
+           If 1Password remote sync is configured, the refreshed cx slot is pushed too.
   status   Show the selected Hermes home, auth/config state, and linked cx account.
 
 Paths:
@@ -601,6 +603,26 @@ async function autoPushNamed(name: string, env: NodeJS.ProcessEnv, io: CliIo): P
   }
 }
 
+function isMissingRemoteBackendError(error: unknown): boolean {
+  if (!(error instanceof CxError)) {
+    return false;
+  }
+  return error.message.includes('remote backend is not configured')
+    || error.message.includes("1Password CLI ('op') was not found");
+}
+
+async function pushHermesSyncedAccountIfRemoteConfigured(name: string, env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
+  try {
+    const result = await syncPushAccount(name, { env, paths: getCodexPaths(env) });
+    write(io.stdout, `auto-pushed profile '${result.account}'`);
+  } catch (error) {
+    if (isMissingRemoteBackendError(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
 function displayBackendName(backend: string | undefined): string {
   return backend === '1password' ? '1Password' : (backend ?? 'remote');
 }
@@ -661,6 +683,10 @@ async function handleHermesCommand(
       const parsed = parseHermesArgs('use <account> [--profile <name>] [--no-config]', rest, { noConfig: true });
       requireArity('hermes use <account> [--profile <name>] [--no-config]', parsed.positionals, 1);
       const account = parsed.positionals[0] ?? '';
+      const pull = await autoPullAccountForUse(account, { env, paths: getCodexPaths(env) });
+      if (pull.action === 'pulled') {
+        write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
+      }
       const result = await useHermesAccount(account, {
         env,
         ...(parsed.profile ? { profile: parsed.profile } : {}),
@@ -686,6 +712,7 @@ async function handleHermesCommand(
       write(io.stdout, `synced Hermes openai-codex tokens to cx account '${result.account}'`);
       write(io.stdout, `cx account file: ${result.codexAccountFile}`);
       write(io.stdout, `hermes home: ${result.hermesHome}`);
+      await pushHermesSyncedAccountIfRemoteConfigured(result.account, env, io);
       return 0;
     }
 

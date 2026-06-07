@@ -119,9 +119,9 @@ cx hermes status                    # show auth/config state without printing to
 cx hermes sync work                 # copy refreshed Hermes tokens back to the cx account slot
 ```
 
-`cx hermes use` writes `providers.openai-codex.tokens` and a `credential_pool.openai-codex` entry labelled `cx:<account>`. By default it also sets `model.provider: openai-codex` in Hermes' `config.yaml`.
+`cx hermes use` writes `providers.openai-codex.tokens` and a `credential_pool.openai-codex` entry labelled `cx:<account>`. By default it also sets `model.provider: openai-codex` in Hermes' `config.yaml`. If 1Password remote sync is configured, `cx hermes use` auto-pulls the named account when the local slot is missing or safely behind remote.
 
-`cx hermes sync` is the manual writeback path for phase 1: if Hermes refreshes the token in `~/.hermes/auth.json`, this copies that refreshed pair back into `~/.codex/accounts/<account>.json`.
+`cx hermes sync` is the manual writeback path: if Hermes refreshes the token in `~/.hermes/auth.json`, this copies that refreshed pair back into `~/.codex/accounts/<account>.json`. If 1Password remote sync is configured, it also pushes the refreshed slot back to 1Password.
 
 ## 1Password-backed profiles
 
@@ -168,7 +168,7 @@ The auto-sync layer is conservative:
 
 - Remote-backed credentials are tracked with non-secret SHA-256 metadata.
 - `cx` auto-pulls when the remote changed and the local copy is still at the last synced hash.
-- `cx` auto-pushes after `cx save`, `cx login`, `cx run`, and shortcut `cx <profile> ...` when the local profile changed.
+- `cx` auto-pushes after `cx save`, `cx login`, `cx run`, shortcut `cx <profile> ...`, and `cx hermes sync` when the local profile changed.
 - If local and remote both changed, `cx` refuses to overwrite either side and asks for explicit conflict resolution.
 - Set `CX_AUTO_SYNC=0` to temporarily disable magic sync while keeping explicit `cx sync ...` commands available.
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.4 - 2026-06-07
+
+### Changed
+
+- `cx hermes use <account>` now participates in remote-backed profile setup: when 1Password sync is configured, missing or safely remote-newer account slots auto-pull before seeding the requested Hermes profile.
+- `cx hermes sync <account>` now pushes the refreshed cx account slot back to 1Password when remote sync is configured, keeping Hermes refreshes shareable across machines.
+
+### Fixed
+
+- Added CLI regression coverage proving Hermes integration can target a second Hermes profile without writing to the default/current Hermes home.
+
 ## 0.2.3 - 2026-06-06
 
 ### Fixed

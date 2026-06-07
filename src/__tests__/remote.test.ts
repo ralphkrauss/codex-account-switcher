@@ -9,6 +9,7 @@ import {
   accountPathForName,
   configureOnePasswordRemote,
   getCodexPaths,
+  getHermesPaths,
   getRemoteConfigPath,
   inspectRemoteStatus,
   inspectSyncStatus,
@@ -478,6 +479,79 @@ test('CLI 1Password setup and --all sync make remote-backed profiles native on a
   assert.equal(useRemoteOnly.status, 0, useRemoteOnly.stderr);
   assert.match(useRemoteOnly.stdout, /pulled 1Password-backed profile 'personal'/u);
   assert.equal((await readFile(join(freshPaths.home, '.current-account'), 'utf8')).trim(), 'personal');
+});
+
+test('CLI Hermes use auto-pulls a missing 1Password-backed profile and only targets the requested Hermes profile', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+  const authJson = `${JSON.stringify({
+    tokens: {
+      access_token: 'remote-hermes-access',
+      refresh_token: 'remote-hermes-refresh',
+    },
+    account: 'gi',
+  }, null, 2)}\n`;
+  const accountFile = await writeAccount(sandbox.paths, 'gi', authJson);
+  await syncPushAccount('gi', { paths: sandbox.paths, env: sandbox.env });
+  await rm(accountFile);
+
+  const hermesEnv = {
+    ...sandbox.env,
+    HOME: sandbox.root,
+    USERPROFILE: sandbox.root,
+    HERMES_HOME: join(sandbox.root, 'should-not-be-used-for-explicit-profile'),
+  };
+  const result = runCli(['hermes', 'use', 'gi', '--profile', 'cx-smoke'], hermesEnv);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /auto-pulled 1Password-backed profile 'gi'/u);
+  assert.match(result.stdout, /Hermes openai-codex auth now uses cx account 'gi'/u);
+  const profilePaths = getHermesPaths({ env: hermesEnv, profile: 'cx-smoke' });
+  const profileAuth = JSON.parse(await readFile(profilePaths.authFile, 'utf8')) as Record<string, any>;
+  assert.equal(profileAuth.providers['openai-codex'].tokens.access_token, 'remote-hermes-access');
+  assert.equal(await readFile(accountFile, 'utf8'), authJson);
+  await assert.rejects(() => readFile(join(hermesEnv.HERMES_HOME ?? '', 'auth.json'), 'utf8'), /ENOENT/u);
+});
+
+test('CLI Hermes sync auto-pushes refreshed profile tokens back to 1Password', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+  await writeAccount(sandbox.paths, 'gi', `${JSON.stringify({
+    tokens: {
+      access_token: 'old-access',
+      refresh_token: 'old-refresh',
+    },
+    account: 'gi',
+  }, null, 2)}\n`);
+  await syncPushAccount('gi', { paths: sandbox.paths, env: sandbox.env });
+
+  const hermesEnv = {
+    ...sandbox.env,
+    HOME: sandbox.root,
+    USERPROFILE: sandbox.root,
+  };
+  const used = runCli(['hermes', 'use', 'gi', '--profile', 'cx-smoke'], hermesEnv);
+  assert.equal(used.status, 0, used.stderr);
+
+  const profilePaths = getHermesPaths({ env: hermesEnv, profile: 'cx-smoke' });
+  const auth = JSON.parse(await readFile(profilePaths.authFile, 'utf8')) as Record<string, any>;
+  auth.providers['openai-codex'].tokens = {
+    access_token: 'refreshed-access',
+    refresh_token: 'refreshed-refresh',
+    extra_token_field: 'preserved-by-hermes',
+  };
+  await writeFile(profilePaths.authFile, `${JSON.stringify(auth, null, 2)}\n`);
+
+  const synced = runCli(['hermes', 'sync', 'gi', '--profile', 'cx-smoke'], hermesEnv);
+  assert.equal(synced.status, 0, synced.stderr);
+  assert.match(synced.stdout, /synced Hermes openai-codex tokens to cx account 'gi'/u);
+  assert.match(synced.stdout, /auto-pushed profile 'gi'/u);
+
+  const localAccount = JSON.parse(await readFile(accountPathForName(sandbox.paths, 'gi'), 'utf8')) as Record<string, any>;
+  assert.equal(localAccount.tokens.access_token, 'refreshed-access');
+  const remoteAccount = JSON.parse(storedAuthJson(await readStore(sandbox.storeFile), 'Dev', 'cx-gi')) as Record<string, any>;
+  assert.equal(remoteAccount.tokens.access_token, 'refreshed-access');
+  assert.equal(remoteAccount.tokens.extra_token_field, 'preserved-by-hermes');
 });
 
 test('CLI remote and sync status do not print auth JSON contents', async (t) => {

@@ -30,8 +30,9 @@ Tasks:
    - `cx 1password status`
    - `cx ls`
    - `cx run <PROFILE_NAME> -- --version`
-6. If a requested profile exists in 1Password but is not local, rely on `cx use <PROFILE_NAME>` or `cx run <PROFILE_NAME> -- ...` to auto-pull it.
-7. If a profile's Codex session has ended, run `cx login <PROFILE_NAME> --force --device-auth`, ask me to complete the browser/device flow, then verify with `cx sync status <PROFILE_NAME>`. The refreshed profile auto-pushes when remote sync is configured.
+6. If a requested profile exists in 1Password but is not local, rely on `cx use <PROFILE_NAME>`, `cx run <PROFILE_NAME> -- ...`, or `cx hermes use <PROFILE_NAME> --profile <HERMES_PROFILE>` to auto-pull it.
+7. For Hermes integration, use a second Hermes profile first: `cx hermes use <PROFILE_NAME> --profile cx-smoke`, then run `hermes --profile cx-smoke ...`. If Hermes refreshes tokens, run `cx hermes sync <PROFILE_NAME> --profile cx-smoke`; with 1Password configured this also pushes the refreshed slot.
+8. If a profile's Codex session has ended, run `cx login <PROFILE_NAME> --force --device-auth`, ask me to complete the browser/device flow, then verify with `cx sync status <PROFILE_NAME>`. The refreshed profile auto-pushes when remote sync is configured.
 
 Use `<VAULT_NAME>` for the 1Password vault that contains the `cx-*` items and `<PROFILE_NAME>` for the profile I want active, for example `gi` or `personal`.
 ```
