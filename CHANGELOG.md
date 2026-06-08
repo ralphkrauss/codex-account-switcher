@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.6 - 2026-06-08
+
+### Added
+
+- Add `cx resume [codex resume args...]` as a first-class passthrough for `codex resume`, including session IDs, prompts, and Codex resume flags such as `--last` and `--include-non-interactive`.
+
 ## 0.2.5 - 2026-06-07
 
 ### Fixed

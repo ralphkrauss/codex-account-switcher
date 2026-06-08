@@ -47,6 +47,7 @@ const SUBCOMMANDS = new Set([
   'login',
   'ls',
   'rename',
+  'resume',
   'remote',
   'rm',
   'run',
@@ -121,6 +122,7 @@ Usage:
   cx save <name> [--force]
   cx use <name>
   cx login <name> [--force] [codex login args...]
+  cx resume [codex resume args...]
   cx rename <old> <new> [--force]
   cx rm <name>
   cx run [name] -- [codex args...]
@@ -971,6 +973,10 @@ export async function main(
       }
       await autoPushNamed(parsed.name, env, io);
       return 0;
+    }
+
+    case 'resume': {
+      return await runCodexAndAutoPush(['resume', ...rest], env, io);
     }
 
     case 'rename': {

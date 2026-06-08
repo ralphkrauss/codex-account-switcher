@@ -110,6 +110,8 @@ The package code itself is installed by npm. Credential data stays under `~/.cod
    cx use gi
    cx use personal
    cx run gi -- exec "summarize this repo"
+   cx resume --last
+   cx resume <session-id>
    ```
 
 ## First machine / bootstrapping profiles into 1Password

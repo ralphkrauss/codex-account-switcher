@@ -63,6 +63,8 @@ cx login work
 cx login personal --force --device-auth
 cx login work -- --with-api-key
 cx use work
+cx resume 019ea2b1-5d71-7d30-b625-f43158d13be8
+cx resume --last
 cx run work -- exec "fix the tests"
 cx run -- --help
 cx hermes use work
@@ -85,6 +87,20 @@ cx work exec "fix the tests"
 ```
 
 This switches to `work`, then launches `codex exec "fix the tests"`.
+
+Resume Codex sessions the same way you normally would with `codex resume`, but through the active `cx` profile:
+
+```bash
+cx resume <session-id>
+cx resume --last
+cx resume <session-id> "follow up prompt"
+```
+
+Use the existing account-prefixed shortcut when you want to resume under a specific profile in one command:
+
+```bash
+cx work resume <session-id>
+```
 
 `cx` with no args launches `codex` if a live `auth.json` exists. If not, it prints setup guidance.
 

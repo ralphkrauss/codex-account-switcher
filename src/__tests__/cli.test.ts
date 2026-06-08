@@ -136,6 +136,46 @@ test('cx run -- uses the current auth and passes codex args after the separator'
   assert.equal(await readNormalized(argsFile), 'exec\nprompt\n');
 });
 
+test('cx resume forwards to codex resume with the current auth', async (t) => {
+  const home = await makeHome(t);
+  const bin = join(home, 'bin');
+  const argsFile = join(home, 'codex-resume-args.txt');
+  const fakeCodex = join(bin, process.platform === 'win32' ? 'codex.cmd' : 'codex');
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(home, 'auth.json'), authPayload('current-live'));
+  await writeFakeCodex(fakeCodex);
+
+  const result = runCli(['resume', '019ea2b1-5d71-7d30-b625-f43158d13be8', 'follow up'], {
+    ...process.env,
+    CODEX_HOME: home,
+    CODEX_ARGS_FILE: argsFile,
+    PATH: [bin, process.env.PATH ?? ''].join(delimiter),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await readNormalized(argsFile), 'resume\n019ea2b1-5d71-7d30-b625-f43158d13be8\nfollow up\n');
+});
+
+test('cx resume forwards Codex resume flags without requiring -- separator', async (t) => {
+  const home = await makeHome(t);
+  const bin = join(home, 'bin');
+  const argsFile = join(home, 'codex-resume-last-args.txt');
+  const fakeCodex = join(bin, process.platform === 'win32' ? 'codex.cmd' : 'codex');
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(home, 'auth.json'), authPayload('current-live'));
+  await writeFakeCodex(fakeCodex);
+
+  const result = runCli(['resume', '--last', '--include-non-interactive'], {
+    ...process.env,
+    CODEX_HOME: home,
+    CODEX_ARGS_FILE: argsFile,
+    PATH: [bin, process.env.PATH ?? ''].join(delimiter),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await readNormalized(argsFile), 'resume\n--last\n--include-non-interactive\n');
+});
+
 test('cx login forwards Codex login flags such as --device-auth', async (t) => {
   const home = await makeHome(t);
   const bin = join(home, 'bin');
