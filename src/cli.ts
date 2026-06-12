@@ -8,7 +8,10 @@ import {
   autoPullAccountForUse,
   autoPushAccountIfChanged,
   configureOnePasswordRemote,
+  finishGoogleDriveOAuth,
   getCodexPaths,
+  inspectAccountLimits,
+  inspectAllAccountLimits,
   inspectHermesStatus,
   inspectDoctor,
   inspectRemoteStatus,
@@ -19,8 +22,10 @@ import {
   removeAccount,
   renameAccount,
   runCodex,
+  runCodexWithIsolatedAccount,
   saveAccount,
   setupOnePasswordProfiles,
+  startGoogleDriveOAuth,
   syncHermesAccount,
   syncPullAccount,
   syncPullAllAccounts,
@@ -41,11 +46,13 @@ import {
 const PACKAGE_NAME = '@ralphkrauss/codex-account-switcher';
 const SUBCOMMANDS = new Set([
   '1password',
+  'backend',
   'doctor',
   'hermes',
   'help',
   'login',
   'ls',
+  'limits',
   'rename',
   'resume',
   'remote',
@@ -95,6 +102,29 @@ interface ParsedOnePasswordSetupArgs extends ParsedRemoteConfigureArgs {
   readonly use?: string;
 }
 
+interface ParsedGoogleDriveOAuthSetupArgs {
+  readonly clientSecretFile?: string;
+  readonly folderId?: string;
+  readonly filePrefix?: string;
+  readonly encryption?: 'none' | 'env';
+  readonly authUrl: boolean;
+  readonly authCode?: string;
+}
+
+interface ParsedRunArgs {
+  readonly account: string | null;
+  readonly isolatedAccount: string | null;
+  readonly codexArgs: readonly string[];
+  readonly stdin: 'inherit' | 'ignore' | undefined;
+  readonly timeoutSeconds: number | undefined;
+}
+
+interface ParsedLimitsArgs {
+  readonly json: boolean;
+  readonly all: boolean;
+  readonly account?: string;
+}
+
 function write(stream: NodeJS.WritableStream, text: string): void {
   stream.write(text.endsWith('\n') ? text : `${text}\n`);
 }
@@ -125,11 +155,18 @@ Usage:
   cx resume [codex resume args...]
   cx rename <old> <new> [--force]
   cx rm <name>
-  cx run [name] -- [codex args...]
+  cx run [name] [--no-stdin] [--timeout <seconds>] -- [codex args...]
+  cx run --account <name> [--no-stdin] [--timeout <seconds>] -- [codex args...]
   cx hermes use <account> [--profile <name>] [--no-config]
   cx hermes sync <account> [--profile <name>]
   cx hermes status [--profile <name>] [--json]
   cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]
+  cx backend status [--json]
+  cx backend list
+  cx backend setup 1password --vault <vault> [--item-prefix <prefix>]
+  cx backend setup gdrive oauth --client-secret <file> [--folder-id <id>] [--encryption env|none] --auth-url
+  cx backend setup gdrive oauth --auth-code <code-or-redirect-url>
+  cx limits <account>|--all [--json]
   cx 1password status [--json]
   cx remote configure 1password --vault <vault> [--item-prefix <prefix>]
   cx remote status [--json]
@@ -183,6 +220,29 @@ Commands:
 
 Notes:
   The default 1Password item prefix is cx-. Token contents are never printed.`;
+}
+
+function backendHelpText(): string {
+  return `Usage:
+  cx backend status [--json]
+  cx backend list
+  cx backend setup 1password --vault <vault> [--item-prefix <prefix>]
+  cx backend setup gdrive oauth --client-secret <file> [--folder-id <id>] [--file-prefix <prefix>] [--encryption env|none] --auth-url
+  cx backend setup gdrive oauth --auth-code <code-or-redirect-url>
+
+Commands:
+  status  Show the configured account backend.
+  list    List supported backends.
+  setup   Configure a backend. Google Drive OAuth uses a paste-code flow:
+          first run --auth-url, open the URL, then run --auth-code with the pasted redirect URL/code.`;
+}
+
+function limitsHelpText(): string {
+  return `Usage:
+  cx limits <account>|--all [--json]
+
+Shows Codex/ChatGPT usage windows for stored accounts using Codex's internal usage endpoint.
+This is best-effort and may change upstream.`;
 }
 
 function onePasswordHelpText(): string {
@@ -371,6 +431,91 @@ function parseOnePasswordSetupArgs(args: readonly string[]): ParsedOnePasswordSe
   return { vault, pull, force, ...(itemPrefix ? { itemPrefix } : {}), ...(use ? { use } : {}) };
 }
 
+function parseGoogleDriveOAuthSetupArgs(args: readonly string[]): ParsedGoogleDriveOAuthSetupArgs {
+  let clientSecretFile: string | undefined;
+  let folderId: string | undefined;
+  let filePrefix: string | undefined;
+  let encryption: 'none' | 'env' | undefined;
+  let authUrl = false;
+  let authCode: string | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index] ?? '';
+    if (arg === '--auth-url') {
+      authUrl = true;
+      continue;
+    }
+    if (arg === '--client-secret' || arg === '--folder-id' || arg === '--file-prefix' || arg === '--encryption' || arg === '--auth-code') {
+      const value = args[index + 1];
+      if (!value || (arg !== '--auth-code' && value.startsWith('-'))) {
+        throw new CxError('usage: cx backend setup gdrive oauth --client-secret <file> [--folder-id <id>] [--file-prefix <prefix>] [--encryption env|none] --auth-url OR --auth-code <code-or-redirect-url>', 2);
+      }
+      if (arg === '--client-secret') {
+        clientSecretFile = value;
+      } else if (arg === '--folder-id') {
+        folderId = value;
+      } else if (arg === '--file-prefix') {
+        filePrefix = value;
+      } else if (arg === '--encryption') {
+        if (value !== 'none' && value !== 'env') {
+          throw new CxError("--encryption must be 'none' or 'env'", 2);
+        }
+        encryption = value;
+      } else {
+        authCode = value;
+      }
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      throw new CxError(`unknown option '${arg}'`, 2);
+    }
+    throw new CxError('usage: cx backend setup gdrive oauth --client-secret <file> [--folder-id <id>] [--file-prefix <prefix>] [--encryption env|none] --auth-url OR --auth-code <code-or-redirect-url>', 2);
+  }
+
+  if (authUrl === Boolean(authCode)) {
+    throw new CxError('choose exactly one of --auth-url or --auth-code <code-or-redirect-url>', 2);
+  }
+  if (authUrl && !clientSecretFile) {
+    throw new CxError('usage: cx backend setup gdrive oauth --client-secret <file> [--folder-id <id>] [--file-prefix <prefix>] [--encryption env|none] --auth-url', 2);
+  }
+  return {
+    ...(clientSecretFile ? { clientSecretFile } : {}),
+    ...(folderId ? { folderId } : {}),
+    ...(filePrefix ? { filePrefix } : {}),
+    ...(encryption ? { encryption } : {}),
+    authUrl,
+    ...(authCode ? { authCode } : {}),
+  };
+}
+
+function parseLimitsArgs(args: readonly string[]): ParsedLimitsArgs {
+  let json = false;
+  let all = false;
+  let account: string | undefined;
+  for (const arg of args) {
+    if (arg === '--json') {
+      json = true;
+      continue;
+    }
+    if (arg === '--all') {
+      all = true;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      throw new CxError(`unknown option '${arg}'`, 2);
+    }
+    if (account) {
+      throw new CxError('usage: cx limits <account>|--all [--json]', 2);
+    }
+    account = arg;
+  }
+  if (all === Boolean(account)) {
+    throw new CxError('usage: cx limits <account>|--all [--json]', 2);
+  }
+  return { json, all, ...(account ? { account } : {}) };
+}
+
 function parseLoginArgs(args: readonly string[]): ParsedLoginArgs {
   let force = false;
   let name: string | null = null;
@@ -524,10 +669,22 @@ function formatRemoteStatus(status: RemoteStatus): string {
     `config: ${status.configPath}`,
     `configured: ${yesNo(status.configured)}`,
     `backend: ${status.backend ?? '(not configured)'}`,
-    `vault: ${status.vault ?? '(not configured)'}`,
-    `item prefix: ${status.itemPrefix ?? '(not configured)'}`,
-    `op CLI: ${status.opAvailable ? `available (${status.opPath ?? 'op'})` : 'not found'}`,
   ];
+  if (status.backend === 'gdrive') {
+    lines.push(
+      `storage: ${status.storage ?? '(not configured)'}`,
+      `folder id: ${status.folderId ?? '(appDataFolder)'}`,
+      `file prefix: ${status.filePrefix ?? '(not configured)'}`,
+      `token file: ${status.tokenFile ?? '(not configured)'}`,
+      `encryption: ${status.encryption ?? '(not configured)'}`,
+    );
+  } else {
+    lines.push(
+      `vault: ${status.vault ?? '(not configured)'}`,
+      `item prefix: ${status.itemPrefix ?? '(not configured)'}`,
+      `op CLI: ${status.opAvailable ? `available (${status.opPath ?? 'op'})` : 'not found'}`,
+    );
+  }
   return lines.join('\n');
 }
 
@@ -544,10 +701,21 @@ function formatSyncStatus(status: SyncStatus): string {
     `config: ${status.configPath}`,
     `configured: ${yesNo(status.configured)}`,
     `backend: ${status.backend ?? '(not configured)'}`,
-    `vault: ${status.vault ?? '(not configured)'}`,
-    `item prefix: ${status.itemPrefix ?? '(not configured)'}`,
-    `op CLI: ${status.opAvailable ? `available (${status.opPath ?? 'op'})` : 'not found'}`,
   ];
+  if (status.backend === 'gdrive') {
+    lines.push(
+      `storage: ${status.storage ?? '(not configured)'}`,
+      `folder id: ${status.folderId ?? '(appDataFolder)'}`,
+      `file prefix: ${status.filePrefix ?? '(not configured)'}`,
+      `encryption: ${status.encryption ?? '(not configured)'}`,
+    );
+  } else {
+    lines.push(
+      `vault: ${status.vault ?? '(not configured)'}`,
+      `item prefix: ${status.itemPrefix ?? '(not configured)'}`,
+      `op CLI: ${status.opAvailable ? `available (${status.opPath ?? 'op'})` : 'not found'}`,
+    );
+  }
 
   if (status.accounts.length === 0) {
     lines.push('accounts: (none)');
@@ -564,6 +732,38 @@ function formatSyncStatus(status: SyncStatus): string {
     lines.push(`    item: ${account.item ?? '(unknown)'}`);
   }
   return lines.join('\n');
+}
+
+type CliAccountLimits = Awaited<ReturnType<typeof inspectAccountLimits>>;
+
+function formatUsageWindow(window: CliAccountLimits['primary']): string {
+  if (!window) {
+    return '(unknown)';
+  }
+  const reset = window.resetAfterSeconds === null ? '' : `, resets in ${window.resetAfterSeconds}s`;
+  return `${window.usedPercent}% used, ${window.remainingPercent}% remaining${reset}`;
+}
+
+function formatLimitsReport(entries: readonly CliAccountLimits[]): string {
+  if (entries.length === 0) {
+    return 'Codex usage limits: (no accounts)';
+  }
+  const blocks = entries.map((entry) => {
+    const lines = [
+      `Codex usage limits for ${entry.account}`,
+      `email: ${entry.email ?? '(unknown)'}`,
+      `plan: ${entry.planType ?? '(unknown)'}`,
+      `allowed: ${entry.allowed === null ? '(unknown)' : yesNo(entry.allowed)}`,
+      `limit reached: ${entry.limitReached === null ? '(unknown)' : yesNo(entry.limitReached)}`,
+      `5h window: ${formatUsageWindow(entry.primary)}`,
+      `weekly window: ${formatUsageWindow(entry.secondary)}`,
+    ];
+    if (entry.credits) {
+      lines.push(`credits: ${entry.credits.unlimited ? 'unlimited' : entry.credits.balance ?? '(unknown)'}`);
+    }
+    return lines.join('\n');
+  });
+  return blocks.join('\n\n');
 }
 
 async function printList(io: CliIo, env: NodeJS.ProcessEnv): Promise<void> {
@@ -591,9 +791,14 @@ async function maybeAutoPullCurrent(env: NodeJS.ProcessEnv, io: CliIo): Promise<
   }
 }
 
-async function runCodexAndAutoPush(args: readonly string[], env: NodeJS.ProcessEnv, io: CliIo): Promise<number> {
+async function runCodexAndAutoPush(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  io: CliIo,
+  options: { readonly stdin?: 'inherit' | 'ignore'; readonly timeoutSeconds?: number } = {},
+): Promise<number> {
   await maybeAutoPullCurrent(env, io);
-  const exitCode = await runCodex(args, { env });
+  const exitCode = await runCodex(args, { env, stdin: options.stdin, timeoutSeconds: options.timeoutSeconds });
   await maybeAutoPushCurrent(env, io);
   return exitCode;
 }
@@ -626,7 +831,13 @@ async function pushHermesSyncedAccountIfRemoteConfigured(name: string, env: Node
 }
 
 function displayBackendName(backend: string | undefined): string {
-  return backend === '1password' ? '1Password' : (backend ?? 'remote');
+  if (backend === '1password') {
+    return '1Password';
+  }
+  if (backend === 'gdrive') {
+    return 'Google Drive';
+  }
+  return backend ?? 'remote';
 }
 
 async function useAccountWithRemoteFallback(name: string, env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
@@ -646,27 +857,84 @@ async function useAccountWithRemoteFallback(name: string, env: NodeJS.ProcessEnv
   }
 }
 
-function parseRunArgs(args: readonly string[]): { account: string | null; codexArgs: readonly string[] } {
+function parsePositiveInteger(value: string, option: string): number {
+  if (!/^\d+$/u.test(value)) {
+    throw new CxError(`${option} must be a positive integer number of seconds`, 2);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new CxError(`${option} must be a positive integer number of seconds`, 2);
+  }
+  return parsed;
+}
+
+function parseRunOptions(beforeSeparator: readonly string[]): Omit<ParsedRunArgs, 'codexArgs'> {
+  let account: string | null = null;
+  let isolatedAccount: string | null = null;
+  let stdin: 'inherit' | 'ignore' | undefined;
+  let timeoutSeconds: number | undefined;
+  const positionals: string[] = [];
+
+  for (let index = 0; index < beforeSeparator.length; index += 1) {
+    const arg = beforeSeparator[index] ?? '';
+    if (arg === '--account') {
+      const value = beforeSeparator[index + 1];
+      if (!value || value.startsWith('-')) {
+        throw new CxError('usage: cx run [name] [--account <name>] [--no-stdin|--stdin] [--timeout <seconds>] -- [codex args...]', 2);
+      }
+      isolatedAccount = value;
+      index += 1;
+      continue;
+    }
+    if (arg === '--no-stdin') {
+      stdin = 'ignore';
+      continue;
+    }
+    if (arg === '--stdin' || arg === '--inherit-stdin') {
+      stdin = 'inherit';
+      continue;
+    }
+    if (arg === '--timeout') {
+      const value = beforeSeparator[index + 1];
+      if (!value) {
+        throw new CxError('usage: cx run [name] [--account <name>] [--no-stdin|--stdin] [--timeout <seconds>] -- [codex args...]', 2);
+      }
+      timeoutSeconds = parsePositiveInteger(value, '--timeout');
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      throw new CxError(`unknown option '${arg}'`, 2);
+    }
+    positionals.push(arg);
+  }
+
+  if (positionals.length > 1 || (isolatedAccount && positionals.length > 0)) {
+    throw new CxError('usage: cx run [name] [--account <name>] [--no-stdin|--stdin] [--timeout <seconds>] -- [codex args...]', 2);
+  }
+  account = positionals[0] ?? null;
+  return { account, isolatedAccount, stdin, timeoutSeconds };
+}
+
+function parseRunArgs(args: readonly string[]): ParsedRunArgs {
   const separatorIndex = args.indexOf('--');
   if (separatorIndex >= 0) {
     const beforeSeparator = args.slice(0, separatorIndex);
-    if (beforeSeparator.length > 1) {
-      throw new CxError('usage: cx run [name] -- [codex args...]', 2);
-    }
+    const parsed = parseRunOptions(beforeSeparator);
     return {
-      account: beforeSeparator[0] ?? null,
+      ...parsed,
       codexArgs: args.slice(separatorIndex + 1),
     };
   }
 
   if (args.length === 0) {
-    return { account: null, codexArgs: [] };
+    return { account: null, isolatedAccount: null, codexArgs: [], stdin: undefined, timeoutSeconds: undefined };
   }
   const [account, ...codexArgs] = args;
   if (!account || account.startsWith('-')) {
     throw new CxError("usage: cx run [name] -- [codex args...] (use '--' before codex flags)", 2);
   }
-  return { account, codexArgs };
+  return { account, isolatedAccount: null, codexArgs, stdin: undefined, timeoutSeconds: undefined };
 }
 
 async function handleHermesCommand(
@@ -732,6 +1000,104 @@ async function handleHermesCommand(
     default:
       throw new CxError(`unknown hermes command '${command}'`, 2);
   }
+}
+
+async function handleBackendCommand(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  io: CliIo,
+): Promise<number> {
+  const [command, ...rest] = args;
+  if (!command || command === 'help' || command === '--help' || command === '-h') {
+    write(io.stdout, backendHelpText());
+    return 0;
+  }
+
+  switch (command) {
+    case 'status': {
+      const parsed = parseJsonArgs(rest);
+      requireArity('backend status [--json]', parsed.positionals, 0);
+      const status = await inspectRemoteStatus({ env, paths: getCodexPaths(env) });
+      write(io.stdout, parsed.json ? JSON.stringify(status, null, 2) : formatRemoteStatus(status));
+      return 0;
+    }
+
+    case 'list':
+      requireArity('backend list', rest, 0);
+      write(io.stdout, 'supported backends:');
+      write(io.stdout, '  1password');
+      write(io.stdout, '  gdrive');
+      return 0;
+
+    case 'setup': {
+      const [backend, mode, ...setupRest] = rest;
+      if (backend === '1password') {
+        const parsed = parseRemoteConfigureArgs(['1password', ...(mode ? [mode, ...setupRest] : [])]);
+        const result = await configureOnePasswordRemote(parsed, { paths: getCodexPaths(env) });
+        write(io.stdout, 'configured remote backend: 1password');
+        write(io.stdout, `config: ${result.configPath}`);
+        write(io.stdout, `vault: ${result.config.vault}`);
+        write(io.stdout, `item prefix: ${result.config.itemPrefix}`);
+        return 0;
+      }
+      if (backend !== 'gdrive' || mode !== 'oauth') {
+        throw new CxError('usage: cx backend setup 1password --vault <vault> [--item-prefix <prefix>] OR cx backend setup gdrive oauth --client-secret <file> --auth-url OR --auth-code <code-or-redirect-url>', 2);
+      }
+      const parsed = parseGoogleDriveOAuthSetupArgs(setupRest);
+      if (parsed.authUrl) {
+        if (!parsed.clientSecretFile) {
+          throw new CxError('usage: cx backend setup gdrive oauth --client-secret <file> [--folder-id <id>] [--file-prefix <prefix>] [--encryption env|none] --auth-url', 2);
+        }
+        const result = await startGoogleDriveOAuth({
+          clientSecretFile: parsed.clientSecretFile,
+          ...(parsed.folderId ? { folderId: parsed.folderId } : {}),
+          ...(parsed.filePrefix ? { filePrefix: parsed.filePrefix } : {}),
+          ...(parsed.encryption ? { encryption: parsed.encryption } : {}),
+        }, { env, paths: getCodexPaths(env) });
+        write(io.stdout, 'Google Drive authorization URL:');
+        write(io.stdout, result.authUrl);
+        write(io.stdout, '');
+        write(io.stdout, `pending file: ${result.pendingFile}`);
+        write(io.stdout, `storage: ${result.storage}`);
+        write(io.stdout, `file prefix: ${result.filePrefix}`);
+        write(io.stdout, `encryption: ${result.encryption}`);
+        write(io.stdout, "After authorizing, run: cx backend setup gdrive oauth --auth-code '<redirect-url-or-code>'");
+        return 0;
+      }
+      if (!parsed.authCode) {
+        throw new CxError('usage: cx backend setup gdrive oauth --auth-code <code-or-redirect-url>', 2);
+      }
+      const result = await finishGoogleDriveOAuth(parsed.authCode, { env, paths: getCodexPaths(env) });
+      write(io.stdout, 'configured Google Drive-backed Codex profiles');
+      write(io.stdout, `config: ${result.configPath}`);
+      write(io.stdout, `token file: ${result.tokenFile}`);
+      write(io.stdout, `storage: ${result.config.storage}`);
+      write(io.stdout, `file prefix: ${result.config.filePrefix}`);
+      write(io.stdout, `encryption: ${result.config.encryption}`);
+      return 0;
+    }
+
+    default:
+      throw new CxError(`unknown backend command '${command}'`, 2);
+  }
+}
+
+async function handleLimitsCommand(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  io: CliIo,
+): Promise<number> {
+  if (args.length === 0 || args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
+    write(io.stdout, limitsHelpText());
+    return 0;
+  }
+  const parsed = parseLimitsArgs(args);
+  const paths = getCodexPaths(env);
+  const results = parsed.all
+    ? await inspectAllAccountLimits({ env, paths })
+    : [await inspectAccountLimits(parsed.account ?? '', { env, paths })];
+  write(io.stdout, parsed.json ? JSON.stringify(results, null, 2) : formatLimitsReport(results));
+  return 0;
 }
 
 async function handleRemoteCommand(
@@ -832,8 +1198,10 @@ async function handleSyncCommand(
       }
       const account = rest[0] ?? '';
       const result = await syncPushAccount(account, { env, paths: getCodexPaths(env) });
-      write(io.stdout, `pushed account '${result.account}' to 1Password item '${result.item}'`);
-      write(io.stdout, `vault: ${result.vault}`);
+      write(io.stdout, `pushed account '${result.account}' to ${displayBackendName(result.backend)} item '${result.item}'`);
+      if (result.vault) {
+        write(io.stdout, `vault: ${result.vault}`);
+      }
       write(io.stdout, `operation: ${result.operation}`);
       return 0;
     }
@@ -867,7 +1235,7 @@ async function handleSyncCommand(
         paths: getCodexPaths(env),
         force,
       });
-      write(io.stdout, `pulled 1Password item '${result.item}' into account '${result.account}'`);
+      write(io.stdout, `pulled ${displayBackendName(result.backend)} item '${result.item}' into account '${result.account}'`);
       write(io.stdout, `account file: ${result.accountFile}`);
       write(io.stdout, `overwrote local account: ${yesNo(result.overwritten)}`);
       return 0;
@@ -1002,11 +1370,30 @@ export async function main(
 
     case 'run': {
       const parsed = parseRunArgs(rest);
+      const runOptions = { stdin: parsed.stdin, timeoutSeconds: parsed.timeoutSeconds };
+      if (parsed.isolatedAccount) {
+        const pull = await autoPullAccountForUse(parsed.isolatedAccount, { env, paths: getCodexPaths(env) });
+        if (pull.action === 'pulled') {
+          write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
+        }
+        write(io.stdout, `→ codex on isolated '${parsed.isolatedAccount}'`);
+        const result = await runCodexWithIsolatedAccount(parsed.isolatedAccount, parsed.codexArgs, {
+          env,
+          stdin: runOptions.stdin,
+          timeoutSeconds: runOptions.timeoutSeconds,
+          paths: getCodexPaths(env),
+          skipWriteback: pull.action === 'pulled',
+        });
+        if (result.authUpdated) {
+          await autoPushNamed(result.account, env, io);
+        }
+        return result.exitCode;
+      }
       if (parsed.account) {
         await useAccountWithRemoteFallback(parsed.account, env, io);
         write(io.stdout, `→ codex on '${parsed.account}'`);
       }
-      return await runCodexAndAutoPush(parsed.codexArgs, env, io);
+      return await runCodexAndAutoPush(parsed.codexArgs, env, io, runOptions);
     }
 
     case 'doctor': {
@@ -1021,6 +1408,12 @@ export async function main(
 
     case 'hermes':
       return await handleHermesCommand(rest, env, io);
+
+    case 'backend':
+      return await handleBackendCommand(rest, env, io);
+
+    case 'limits':
+      return await handleLimitsCommand(rest, env, io);
 
     case '1password':
       return await handleOnePasswordCommand(rest, env, io);

@@ -38,7 +38,7 @@ cx 1password setup --vault Codex --pull --use gi
 
 For a copy-pasteable prompt you can give another agent, plus macOS/Windows/Linux, bootstrap, headless EC2, and troubleshooting steps, see [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md).
 
-Agent safety rule: do not paste or print `auth.json`, `accounts/*.json`, OAuth tokens, refresh tokens, or 1Password concealed-field contents. Use `cx doctor`, `cx 1password status`, `cx sync status`, and `cx ls` for verification instead.
+Agent safety rule: do not paste or print `auth.json`, `accounts/*.json`, OAuth tokens, refresh tokens, Google OAuth token/client-secret files, encryption keys, or 1Password concealed-field contents. Use `cx doctor`, `cx backend status`, `cx 1password status`, `cx sync status`, `cx limits --all --json`, and `cx ls` for verification instead.
 
 ## Data layout
 
@@ -66,11 +66,17 @@ cx use work
 cx resume 019ea2b1-5d71-7d30-b625-f43158d13be8
 cx resume --last
 cx run work -- exec "fix the tests"
+cx run --account work --timeout 1800 -- exec --json --output-last-message /tmp/final.md "fix the tests"
+cx run --no-stdin -- exec "non-interactive prompt"
 cx run -- --help
 cx hermes use work
 cx hermes status
 cx hermes sync work
 cx 1password setup --vault Private --pull --use work
+cx backend setup gdrive oauth --client-secret ./client-secret.json --auth-url
+cx backend setup gdrive oauth --auth-code '<redirect-url-or-code>'
+cx backend status
+cx limits --all --json
 cx 1password status
 cx sync push --all
 cx sync pull --all
@@ -121,7 +127,33 @@ Empty names, dot-only names, slashes, backslashes, spaces, unicode, and path tra
 - `cx rm <active>` removes the saved slot and clears `.current-account`; it leaves live `auth.json` untouched until you switch or login.
 - `cx save` and `cx rename` refuse overwrites unless `--force` is passed.
 - `cx login <name>` forwards extra arguments to `codex login`, so headless flows such as `cx login personal --force --device-auth` work on remote machines; use `--force` when refreshing an existing saved profile.
+- `cx run --account <name> -- ...` uses a per-invocation isolated `CODEX_HOME`; it does not swap shared `auth.json`, so concurrent orchestrated runs and interactive `cx use` calls cannot affect each other.
+- `cx run` closes child stdin by default when `cx` itself is not attached to a TTY. Use `--no-stdin` to force that behavior, or `--stdin`/`--inherit-stdin` when you intentionally need to pass stdin through.
+- `cx run --timeout <seconds> -- ...` terminates the child process group and exits `124` on timeout. Codex stderr that looks like quota/rate-limit exhaustion maps to exit `75`.
 - `cx doctor`, `cx remote status`, and `cx sync status` never print token contents.
+
+## Orchestrated non-interactive runs
+
+For mission orchestrators or other fan-out runners, prefer the isolated form:
+
+```bash
+cx run --account <name> --timeout 1800 -- exec \
+  -c model=gpt-5.1-codex-max \
+  --cd <worktree> \
+  --sandbox workspace-write \
+  --json \
+  --output-last-message <file> \
+  "<prompt>"
+```
+
+This copies the selected account into a temporary per-run `CODEX_HOME`, launches Codex there, then writes any refreshed child auth back to `accounts/<name>.json` without changing the shared live `auth.json` or `.current-account`. Existing interactive commands such as `cx use personal` remain global/shared by design, but they cannot alter already-running isolated invocations.
+
+Operational exit codes for callers:
+
+- `0`: Codex completed successfully.
+- `75`: stderr looked like quota/rate-limit exhaustion (`usage limit`, `rate limit`, `quota`, `429`, etc.).
+- `124`: `--timeout` expired and `cx` terminated the child process group.
+- Other non-zero: normal Codex/process failure.
 
 ## Hermes integration
 
@@ -138,6 +170,36 @@ cx hermes sync work                 # copy refreshed Hermes tokens back to the c
 `cx hermes use` writes `providers.openai-codex.tokens` and a `credential_pool.openai-codex` entry labelled `cx:<account>`. By default it also sets `model.provider: openai-codex` in Hermes' `config.yaml`. If 1Password remote sync is configured, `cx hermes use` auto-pulls the named account when the local slot is missing or safely behind remote.
 
 `cx hermes sync` is the manual writeback path: if Hermes refreshes the token in `~/.hermes/auth.json`, this copies that refreshed pair back into `~/.codex/accounts/<account>.json`. If 1Password remote sync is configured, it also pushes the refreshed slot back to 1Password.
+
+## Google Drive-backed profiles
+
+`cx` can also use Google Drive as the remote profile backend. The default OAuth flow stores profile files in Drive `appDataFolder` so no folder choice is required; pass `--folder-id <id>` if you want a normal/shared folder instead.
+
+Headless/devbox setup uses a paste-code OAuth flow:
+
+```bash
+cx backend setup gdrive oauth --client-secret ./client-secret.json --auth-url
+# Open the printed URL, approve access, then paste the resulting redirect URL or code:
+cx backend setup gdrive oauth --auth-code '<redirect-url-or-code>'
+```
+
+Optional client-side encryption is available without changing the sync workflow:
+
+```bash
+export CX_GDRIVE_ENCRYPTION_KEY='your-shared-passphrase'
+cx backend setup gdrive oauth --client-secret ./client-secret.json --encryption env --auth-url
+```
+
+After setup, the existing sync commands are backend-neutral:
+
+```bash
+cx sync push work
+cx sync pull work
+cx sync status work
+cx backend status
+```
+
+`cx limits <account>|--all [--json]` reports normalized Codex/ChatGPT usage windows for saved profiles. It uses Codex's internal ChatGPT usage endpoint on a best-effort basis, so treat it as operational telemetry rather than a stable public API.
 
 ## 1Password-backed profiles
 

@@ -25,16 +25,30 @@ import {
   writebackCurrentAccount,
   type CodexPaths,
 } from './accounts.js';
+import {
+  DEFAULT_GDRIVE_FILE_PREFIX,
+  finishGoogleDriveOAuth,
+  googleDriveFileExists,
+  googleDriveItemName,
+  listGoogleDriveAccountNames,
+  readGoogleDriveAccount,
+  startGoogleDriveOAuth,
+  upsertGoogleDriveAuthJson,
+} from './gdrive.js';
+export { finishGoogleDriveOAuth, startGoogleDriveOAuth } from './gdrive.js';
+export type { FinishGoogleDriveOAuthResult, StartGoogleDriveOAuthInput, StartGoogleDriveOAuthResult } from './gdrive.js';
 
 export const REMOTE_CONFIG_VERSION = 1;
 export const DEFAULT_ONEPASSWORD_ITEM_PREFIX = 'cx-';
 export const ONEPASSWORD_BACKEND = '1password';
+export const GDRIVE_BACKEND = 'gdrive';
 export const ONEPASSWORD_AUTH_FIELD = 'auth_json';
 export const REMOTE_METADATA_FIELD = 'cx_metadata';
 export const LOCAL_SYNC_METADATA_VERSION = 1;
 
-export type RemoteBackend = typeof ONEPASSWORD_BACKEND;
+export type RemoteBackend = typeof ONEPASSWORD_BACKEND | typeof GDRIVE_BACKEND;
 export type RemotePresence = 'present' | 'missing' | 'unknown';
+export type GoogleDriveStorage = 'appDataFolder' | 'folder';
 
 export interface OnePasswordRemoteConfig {
   readonly version: typeof REMOTE_CONFIG_VERSION;
@@ -43,7 +57,18 @@ export interface OnePasswordRemoteConfig {
   readonly itemPrefix: string;
 }
 
-export type RemoteConfig = OnePasswordRemoteConfig;
+export interface GoogleDriveRemoteConfig {
+  readonly version: typeof REMOTE_CONFIG_VERSION;
+  readonly backend: typeof GDRIVE_BACKEND;
+  readonly storage: GoogleDriveStorage;
+  readonly folderId?: string;
+  readonly tokenFile: string;
+  readonly clientSecretFile: string;
+  readonly filePrefix: string;
+  readonly encryption: 'none' | 'env';
+}
+
+export type RemoteConfig = OnePasswordRemoteConfig | GoogleDriveRemoteConfig;
 
 export interface ConfigureOnePasswordRemoteInput {
   readonly vault: string;
@@ -75,13 +100,18 @@ export interface RemoteStatus {
   readonly itemPrefix: string | null;
   readonly opAvailable: boolean;
   readonly opPath: string | null;
+  readonly storage?: GoogleDriveStorage | null;
+  readonly folderId?: string | null;
+  readonly filePrefix?: string | null;
+  readonly tokenFile?: string | null;
+  readonly encryption?: 'none' | 'env' | null;
 }
 
 export interface SyncPushResult {
   readonly account: string;
   readonly accountFile: string;
   readonly backend: RemoteBackend;
-  readonly vault: string;
+  readonly vault: string | null;
   readonly item: string;
   readonly operation: 'created' | 'updated';
 }
@@ -90,7 +120,7 @@ export interface SyncPullResult {
   readonly account: string;
   readonly accountFile: string;
   readonly backend: RemoteBackend;
-  readonly vault: string;
+  readonly vault: string | null;
   readonly item: string;
   readonly overwritten: boolean;
 }
@@ -150,6 +180,11 @@ export interface SyncStatus {
   readonly itemPrefix: string | null;
   readonly opAvailable: boolean;
   readonly opPath: string | null;
+  readonly storage?: GoogleDriveStorage | null;
+  readonly folderId?: string | null;
+  readonly filePrefix?: string | null;
+  readonly tokenFile?: string | null;
+  readonly encryption?: 'none' | 'env' | null;
   readonly accounts: readonly SyncStatusAccount[];
 }
 
@@ -184,6 +219,14 @@ type JsonObject = Record<string, unknown>;
 
 function isRecord(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isOnePasswordConfig(config: RemoteConfig): config is OnePasswordRemoteConfig {
+  return config.backend === ONEPASSWORD_BACKEND;
+}
+
+function isGoogleDriveConfig(config: RemoteConfig): config is GoogleDriveRemoteConfig {
+  return config.backend === GDRIVE_BACKEND;
 }
 
 function errorMessage(error: unknown): string {
@@ -290,8 +333,8 @@ async function readLocalSyncMetadata(paths: CodexPaths, account: string): Promis
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!isRecord(parsed)
+      || (parsed.backend !== ONEPASSWORD_BACKEND && parsed.backend !== GDRIVE_BACKEND)
       || parsed.version !== LOCAL_SYNC_METADATA_VERSION
-      || parsed.backend !== ONEPASSWORD_BACKEND
       || parsed.account !== account
       || typeof parsed.remoteAuthJsonSha256 !== 'string'
       || typeof parsed.lastSyncedAuthJsonSha256 !== 'string'
@@ -301,7 +344,7 @@ async function readLocalSyncMetadata(paths: CodexPaths, account: string): Promis
     }
     return {
       version: LOCAL_SYNC_METADATA_VERSION,
-      backend: ONEPASSWORD_BACKEND,
+      backend: parsed.backend,
       account,
       ...(typeof parsed.vault === 'string' ? { vault: parsed.vault } : {}),
       ...(typeof parsed.item === 'string' ? { item: parsed.item } : {}),
@@ -327,7 +370,7 @@ async function writeLocalSyncMetadata(
     version: LOCAL_SYNC_METADATA_VERSION,
     backend: config.backend,
     account,
-    vault: config.vault,
+    ...(isOnePasswordConfig(config) ? { vault: config.vault } : {}),
     item: itemTitle(config, account),
     remoteAuthJsonSha256: remoteMetadata?.authJsonSha256 ?? hash,
     lastSyncedAuthJsonSha256: hash,
@@ -467,6 +510,13 @@ function normalizeItemPrefix(value: unknown, exitCode = 1): string {
   return nonEmptyConfigString(value, '1Password item prefix', exitCode);
 }
 
+function normalizeGoogleDriveFilePrefix(value: unknown, exitCode = 1): string {
+  if (value === undefined || value === null) {
+    return DEFAULT_GDRIVE_FILE_PREFIX;
+  }
+  return nonEmptyConfigString(value, 'Google Drive file prefix', exitCode);
+}
+
 function parseRemoteConfig(parsed: unknown, configPath: string): RemoteConfig {
   if (!isRecord(parsed)) {
     throw new CxError(`remote config at ${configPath} must be a JSON object`, 1);
@@ -474,16 +524,32 @@ function parseRemoteConfig(parsed: unknown, configPath: string): RemoteConfig {
   if (parsed.version !== REMOTE_CONFIG_VERSION) {
     throw new CxError(`unsupported remote config version at ${configPath}`, 1);
   }
-  if (parsed.backend !== ONEPASSWORD_BACKEND) {
-    throw new CxError(`unsupported remote backend in ${configPath}`, 1);
+  if (parsed.backend === ONEPASSWORD_BACKEND) {
+    return {
+      version: REMOTE_CONFIG_VERSION,
+      backend: ONEPASSWORD_BACKEND,
+      vault: nonEmptyConfigString(parsed.vault, '1Password vault'),
+      itemPrefix: normalizeItemPrefix(parsed.itemPrefix),
+    };
   }
-
-  return {
-    version: REMOTE_CONFIG_VERSION,
-    backend: ONEPASSWORD_BACKEND,
-    vault: nonEmptyConfigString(parsed.vault, '1Password vault'),
-    itemPrefix: normalizeItemPrefix(parsed.itemPrefix),
-  };
+  if (parsed.backend === GDRIVE_BACKEND) {
+    const storage = parsed.storage === 'folder' ? 'folder' : parsed.storage === 'appDataFolder' ? 'appDataFolder' : null;
+    if (!storage) {
+      throw new CxError(`Google Drive remote config at ${configPath} has invalid storage`, 1);
+    }
+    const folderId = storage === 'folder' ? nonEmptyConfigString(parsed.folderId, 'Google Drive folder id') : undefined;
+    return {
+      version: REMOTE_CONFIG_VERSION,
+      backend: GDRIVE_BACKEND,
+      storage,
+      ...(folderId ? { folderId } : {}),
+      tokenFile: nonEmptyConfigString(parsed.tokenFile, 'Google Drive token file'),
+      clientSecretFile: nonEmptyConfigString(parsed.clientSecretFile, 'Google Drive client secret file'),
+      filePrefix: normalizeGoogleDriveFilePrefix(parsed.filePrefix),
+      encryption: parsed.encryption === 'env' ? 'env' : 'none',
+    };
+  }
+  throw new CxError(`unsupported remote backend in ${configPath}`, 1);
 }
 
 export async function readRemoteConfig(options: RemotePathOptions = {}): Promise<RemoteConfig | null> {
@@ -513,7 +579,7 @@ async function requireRemoteConfig(options: RemotePathOptions = {}): Promise<Rem
   const paths = remotePaths(options);
   const config = await readRemoteConfig({ paths });
   if (!config) {
-    throw new CxError(`remote backend is not configured (run: cx remote configure 1password --vault <vault>)`, 1);
+    throw new CxError(`remote backend is not configured (run: cx backend setup 1password --vault <vault> or cx backend setup gdrive oauth --client-secret <file> --auth-url)`, 1);
   }
   return config;
 }
@@ -521,10 +587,10 @@ async function requireRemoteConfig(options: RemotePathOptions = {}): Promise<Rem
 export async function configureOnePasswordRemote(
   input: ConfigureOnePasswordRemoteInput,
   options: RemotePathOptions = {},
-): Promise<ConfigureRemoteResult> {
+): Promise<ConfigureRemoteResult & { readonly config: OnePasswordRemoteConfig }> {
   const paths = remotePaths(options);
   const configPath = getRemoteConfigPath(paths);
-  const config: RemoteConfig = {
+  const config: OnePasswordRemoteConfig = {
     version: REMOTE_CONFIG_VERSION,
     backend: ONEPASSWORD_BACKEND,
     vault: nonEmptyConfigString(input.vault, '1Password vault', 2),
@@ -538,16 +604,24 @@ export async function configureOnePasswordRemote(
 export async function inspectRemoteStatus(options: RemoteCliOptions = {}): Promise<RemoteStatus> {
   const paths = remotePaths(options);
   const config = await readRemoteConfig({ paths });
-  const env = await loadOnePasswordServiceAccountEnv(options.env ?? process.env);
-  const opPath = await resolveOpPath(env);
+  const env = options.env ?? process.env;
+  const opEnv = config && isOnePasswordConfig(config) ? await loadOnePasswordServiceAccountEnv(env) : env;
+  const opPath = config && isOnePasswordConfig(config) ? await resolveOpPath(opEnv) : null;
+  const onePasswordConfig = config && isOnePasswordConfig(config) ? config as OnePasswordRemoteConfig : null;
+  const gdriveConfig = config && isGoogleDriveConfig(config) ? config as GoogleDriveRemoteConfig : null;
   return {
     configPath: getRemoteConfigPath(paths),
     configured: config !== null,
     backend: config?.backend ?? null,
-    vault: config?.vault ?? null,
-    itemPrefix: config?.itemPrefix ?? null,
+    vault: onePasswordConfig?.vault ?? null,
+    itemPrefix: onePasswordConfig?.itemPrefix ?? null,
     opAvailable: opPath !== null,
     opPath,
+    storage: gdriveConfig?.storage ?? null,
+    folderId: gdriveConfig?.folderId ?? null,
+    filePrefix: gdriveConfig?.filePrefix ?? null,
+    tokenFile: gdriveConfig?.tokenFile ?? null,
+    encryption: gdriveConfig?.encryption ?? null,
   };
 }
 
@@ -661,10 +735,12 @@ function looksLikeMissingField(result: OpResult): boolean {
 }
 
 function itemTitle(config: RemoteConfig, account: string): string {
-  return `${config.itemPrefix}${account}`;
+  return isOnePasswordConfig(config)
+    ? `${config.itemPrefix}${account}`
+    : googleDriveItemName(config, account);
 }
 
-function accountNameFromItemTitle(config: RemoteConfig, title: string): string | null {
+function accountNameFromItemTitle(config: OnePasswordRemoteConfig, title: string): string | null {
   if (!title.startsWith(config.itemPrefix)) {
     return null;
   }
@@ -697,7 +773,7 @@ function parseOnePasswordItemTitles(stdout: string, action: string): string[] {
 }
 
 async function listOnePasswordAccountNames(
-  config: RemoteConfig,
+  config: OnePasswordRemoteConfig,
   env: NodeJS.ProcessEnv,
 ): Promise<string[]> {
   const result = await runOp([
@@ -716,7 +792,7 @@ async function listOnePasswordAccountNames(
   );
 }
 
-async function verifyOnePasswordVault(config: RemoteConfig, env: NodeJS.ProcessEnv): Promise<void> {
+async function verifyOnePasswordVault(config: OnePasswordRemoteConfig, env: NodeJS.ProcessEnv): Promise<void> {
   await runOp([
     'vault',
     'get',
@@ -742,7 +818,7 @@ async function listRemoteSyncAccountNames(paths: CodexPaths): Promise<string[]> 
 }
 
 async function onePasswordItemExists(
-  config: RemoteConfig,
+  config: OnePasswordRemoteConfig,
   item: string,
   env: NodeJS.ProcessEnv,
 ): Promise<boolean> {
@@ -845,7 +921,7 @@ async function runOpWithTemplate(
 }
 
 async function upsertOnePasswordAuthJson(
-  config: RemoteConfig,
+  config: OnePasswordRemoteConfig,
   item: string,
   account: string,
   authJson: string,
@@ -977,7 +1053,7 @@ function decodeOnePasswordAccountFromItemJson(stdout: string, item: string): { a
 }
 
 async function readOnePasswordAuthJson(
-  config: RemoteConfig,
+  config: OnePasswordRemoteConfig,
   item: string,
   env: NodeJS.ProcessEnv,
 ): Promise<string> {
@@ -985,7 +1061,7 @@ async function readOnePasswordAuthJson(
 }
 
 async function readOnePasswordAccount(
-  config: RemoteConfig,
+  config: OnePasswordRemoteConfig,
   item: string,
   env: NodeJS.ProcessEnv,
 ): Promise<{ authJson: string; metadata: RemoteAuthMetadata | null }> {
@@ -1098,14 +1174,16 @@ export async function syncPushAccount(
   await writebackCurrentAccountIfSyncTarget(safeAccount, paths);
   const local = await readLocalAccountAuthJson(safeAccount, paths);
   const item = itemTitle(config, local.account);
-  const upload = await upsertOnePasswordAuthJson(config, item, local.account, local.authJson, env);
+  const upload = isOnePasswordConfig(config)
+    ? await upsertOnePasswordAuthJson(config, item, local.account, local.authJson, env)
+    : await upsertGoogleDriveAuthJson(config, item, local.account, local.authJson, env);
   await writeLocalSyncMetadata(paths, config, local.account, local.authJson, upload.metadata);
 
   return {
     account: local.account,
     accountFile: local.accountFile,
     backend: config.backend,
-    vault: config.vault,
+    vault: isOnePasswordConfig(config) ? config.vault : null,
     item,
     operation: upload.operation,
   };
@@ -1120,7 +1198,9 @@ export async function syncPullAccount(
   const config = await requireRemoteConfig({ paths });
   const safeAccount = validateRemoteSyncAccountName(account);
   const item = itemTitle(config, safeAccount);
-  const remote = await readOnePasswordAccount(config, item, env);
+  const remote = isOnePasswordConfig(config)
+    ? await readOnePasswordAccount(config, item, env)
+    : await readGoogleDriveAccount(config, item, env);
   const verifiedMetadata = remote.metadata
     && remote.metadata.account === safeAccount
     && remote.metadata.authJsonSha256 === sha256Hex(remote.authJson)
@@ -1133,7 +1213,7 @@ export async function syncPullAccount(
     account: local.account,
     accountFile: local.accountFile,
     backend: config.backend,
-    vault: config.vault,
+    vault: isOnePasswordConfig(config) ? config.vault : null,
     item,
     overwritten: local.overwritten,
   };
@@ -1143,7 +1223,9 @@ export async function listRemoteAccountNames(options: RemoteCliOptions = {}): Pr
   const env = options.env ?? process.env;
   const paths = remotePaths(options);
   const config = await requireRemoteConfig({ paths });
-  return await listOnePasswordAccountNames(config, env);
+  return isOnePasswordConfig(config)
+    ? await listOnePasswordAccountNames(config, env)
+    : await listGoogleDriveAccountNames(config, env);
 }
 
 export async function syncPullAllAccounts(options: RemoteForceOptions = {}): Promise<SyncPullResult[]> {
@@ -1193,7 +1275,9 @@ async function readRemoteAccountMetadata(
   env: NodeJS.ProcessEnv,
 ): Promise<{ metadata: RemoteAuthMetadata | null; authJson?: string }> {
   const item = itemTitle(config, account);
-  const remote = await readOnePasswordAccount(config, item, env);
+  const remote = isOnePasswordConfig(config)
+    ? await readOnePasswordAccount(config, item, env)
+    : await readGoogleDriveAccount(config, item, env);
   const actualHash = sha256Hex(remote.authJson);
   const metadata = remote.metadata
     && remote.metadata.account === account
@@ -1403,16 +1487,20 @@ export async function inspectSyncStatus(
   account?: string,
   options: RemoteCliOptions = {},
 ): Promise<SyncStatus> {
-  const env = await loadOnePasswordServiceAccountEnv(options.env ?? process.env);
+  const baseEnv = options.env ?? process.env;
   const paths = remotePaths(options);
   const config = await readRemoteConfig({ paths });
-  const opPath = await resolveOpPath(env);
+  const env = config && isOnePasswordConfig(config) ? await loadOnePasswordServiceAccountEnv(baseEnv) : baseEnv;
+  const opPath = config && isOnePasswordConfig(config) ? await resolveOpPath(env) : null;
   let accounts = account ? [validateRemoteSyncAccountName(account)] : await listRemoteSyncAccountNames(paths);
   const statuses: SyncStatusAccount[] = [];
 
-  if (!account && config && opPath) {
+  if (!account && config) {
     try {
-      accounts = sortedUnique([...accounts, ...await listOnePasswordAccountNames(config, env)]);
+      const remoteAccounts = isOnePasswordConfig(config)
+        ? (opPath ? await listOnePasswordAccountNames(config as OnePasswordRemoteConfig, env) : [])
+        : await listGoogleDriveAccountNames(config, env);
+      accounts = sortedUnique([...accounts, ...remoteAccounts]);
     } catch {
       // Keep local status useful; per-account remote errors are reported below.
     }
@@ -1426,11 +1514,13 @@ export async function inspectSyncStatus(
 
     if (!config) {
       remoteError = 'remote backend is not configured';
-    } else if (!opPath) {
+    } else if (isOnePasswordConfig(config) && !opPath) {
       remoteError = missingOpError().message;
     } else {
       try {
-        presence = await onePasswordItemExists(config, remoteItem ?? '', env) ? 'present' : 'missing';
+        presence = isOnePasswordConfig(config)
+          ? await onePasswordItemExists(config as OnePasswordRemoteConfig, remoteItem ?? '', env) ? 'present' : 'missing'
+          : await googleDriveFileExists(config, remoteItem ?? '', env) ? 'present' : 'missing';
       } catch (error) {
         remoteError = errorMessage(error);
       }
@@ -1453,14 +1543,21 @@ export async function inspectSyncStatus(
     });
   }
 
+  const onePasswordConfig = config && isOnePasswordConfig(config) ? config as OnePasswordRemoteConfig : null;
+  const gdriveConfig = config && isGoogleDriveConfig(config) ? config as GoogleDriveRemoteConfig : null;
   return {
     configPath: getRemoteConfigPath(paths),
     configured: config !== null,
     backend: config?.backend ?? null,
-    vault: config?.vault ?? null,
-    itemPrefix: config?.itemPrefix ?? null,
+    vault: onePasswordConfig?.vault ?? null,
+    itemPrefix: onePasswordConfig?.itemPrefix ?? null,
     opAvailable: opPath !== null,
     opPath,
+    storage: gdriveConfig?.storage ?? null,
+    folderId: gdriveConfig?.folderId ?? null,
+    filePrefix: gdriveConfig?.filePrefix ?? null,
+    tokenFile: gdriveConfig?.tokenFile ?? null,
+    encryption: gdriveConfig?.encryption ?? null,
     accounts: statuses,
   };
 }

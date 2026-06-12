@@ -4,6 +4,7 @@ import {
   chmod,
   copyFile,
   mkdir,
+  mkdtemp,
   readdir,
   readFile,
   rename,
@@ -12,7 +13,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { constants as fsConstants, type Stats } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import {
   delimiter,
   dirname,
@@ -24,6 +25,8 @@ import {
 
 export const AUTH_NON_EMPTY_BYTES = 100;
 export const ACCOUNT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/u;
+export const CODEX_TIMEOUT_EXIT_CODE = 124;
+export const CODEX_RATE_LIMIT_EXIT_CODE = 75;
 
 export interface CodexPaths {
   readonly home: string;
@@ -46,6 +49,8 @@ export interface SpawnCodexOptions {
   readonly args?: readonly string[];
   readonly env?: NodeJS.ProcessEnv;
   readonly cwd?: string;
+  readonly stdin?: 'inherit' | 'ignore';
+  readonly timeoutSeconds?: number;
 }
 
 export interface LoginAccountOptions extends ForceOptions, SpawnCodexOptions {
@@ -506,33 +511,186 @@ function signalExitCode(signal: NodeJS.Signals): number {
   return 1;
 }
 
+function stderrLooksQuotaLimited(stderr: string): boolean {
+  return /(?:usage limit|rate limit|quota|too many requests|\b429\b|limit reached)/iu.test(stderr);
+}
+
+function terminateChildProcessGroup(child: ReturnType<typeof spawn>): void {
+  if (!child.pid) {
+    return;
+  }
+  if (process.platform === 'win32') {
+    try {
+      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+    } catch {
+      child.kill('SIGTERM');
+    }
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    child.kill('SIGTERM');
+  }
+}
+
+function killChildProcessGroup(child: ReturnType<typeof spawn>): void {
+  if (!child.pid) {
+    return;
+  }
+  if (process.platform === 'win32') {
+    child.kill('SIGKILL');
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    child.kill('SIGKILL');
+  }
+}
+
 export async function runCodex(
   codexArgs: readonly string[] = [],
   options: SpawnCodexOptions = {},
 ): Promise<number> {
   const command = options.command ?? 'codex';
   const args = [...(options.args ?? codexArgs)];
+  const env = options.env ?? process.env;
+  const stdinMode = options.stdin ?? (process.stdin.isTTY ? 'inherit' : 'ignore');
+  const timeoutSeconds = options.timeoutSeconds;
+  const timeoutMs = timeoutSeconds === undefined ? undefined : Math.max(1, Math.floor(timeoutSeconds * 1000));
+  const detached = timeoutMs !== undefined && process.platform !== 'win32';
 
   return await new Promise((resolvePromise, reject) => {
+    let stderrTail = '';
+    let timedOut = false;
+    let timeout: NodeJS.Timeout | undefined;
+    let killTimeout: NodeJS.Timeout | undefined;
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: options.env ?? process.env,
-      stdio: 'inherit',
+      env,
+      stdio: [stdinMode, 'inherit', 'pipe'],
       windowsHide: false,
       shell: process.platform === 'win32',
+      detached,
     });
 
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk;
+      process.stderr.write(text);
+      stderrTail = `${stderrTail}${text}`.slice(-65_536);
+    });
+
+    if (timeoutMs !== undefined) {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        process.stderr.write(`cx: codex timed out after ${timeoutSeconds} seconds; terminating process group\n`);
+        terminateChildProcessGroup(child);
+        killTimeout = setTimeout(() => killChildProcessGroup(child), 2_000);
+      }, timeoutMs);
+    }
+
     child.on('error', (error) => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
       reject(new CxError(`failed to run '${command}': ${error.message}`, 1));
     });
     child.on('exit', (code, signal) => {
-      if (typeof code === 'number') {
-        resolvePromise(code);
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
+      if (timedOut) {
+        resolvePromise(CODEX_TIMEOUT_EXIT_CODE);
         return;
       }
-      resolvePromise(signal ? signalExitCode(signal) : 1);
+      const exitCode = typeof code === 'number' ? code : (signal ? signalExitCode(signal) : 1);
+      if (exitCode !== 0 && stderrLooksQuotaLimited(stderrTail)) {
+        resolvePromise(CODEX_RATE_LIMIT_EXIT_CODE);
+        return;
+      }
+      resolvePromise(exitCode);
     });
   });
+}
+
+export interface IsolatedRunResult {
+  readonly exitCode: number;
+  readonly account: string;
+  readonly authUpdated: boolean;
+}
+
+async function copyOptionalFilePrivate(source: string, destination: string): Promise<void> {
+  if (await pathExists(source)) {
+    await copyFilePrivate(source, destination);
+  }
+}
+
+async function copyIsolatedAuthBack(accountFile: string, isolatedPaths: CodexPaths): Promise<boolean> {
+  if (!(await authLooksNonEmpty(isolatedPaths))) {
+    return false;
+  }
+  const original = await readFile(accountFile, 'utf8');
+  const updated = await readFile(isolatedPaths.authFile, 'utf8');
+  let originalAccountId: string | null = null;
+  const updatedAccountId = parseAuthJsonForWriteback(updated).accountId;
+  try {
+    originalAccountId = parseAuthJsonForWriteback(original).accountId;
+  } catch {
+    // Older saved fixtures/formats may not be parseable for account_id checks;
+    // still require the isolated child auth to be valid JSON before writeback.
+  }
+  if (originalAccountId && updatedAccountId && originalAccountId !== updatedAccountId) {
+    throw new CxError('isolated codex run produced auth.json for a different account_id; refusing to update account slot', 1);
+  }
+  if (updated === original) {
+    return false;
+  }
+  await writeFilePrivate(accountFile, updated);
+  return true;
+}
+
+export async function runCodexWithIsolatedAccount(
+  name: string,
+  codexArgs: readonly string[] = [],
+  options: OperationOptions & SpawnCodexOptions = {},
+): Promise<IsolatedRunResult> {
+  const env = options.env ?? process.env;
+  const { paths: _ignoredPaths, skipWriteback: _ignoredSkipWriteback, ...spawnOptions } = options;
+  const paths = options.paths ?? getCodexPaths(env);
+  const safeName = validateAccountName(name);
+  const accountFile = accountPathForName(paths, safeName);
+  if (!(await pathExists(accountFile))) {
+    throw new CxError(`no account '${safeName}'`, 1);
+  }
+
+  const current = await readCurrentMarker(paths);
+  if (current.state === 'valid' && current.name === safeName && options.skipWriteback !== true) {
+    await writebackCurrentAccount({ paths });
+  }
+
+  const isolatedHome = await mkdtemp(join(tmpdir(), `cx-run-${safeName}-`));
+  const isolatedEnv = { ...env, CODEX_HOME: isolatedHome };
+  const isolatedPaths = getCodexPaths(isolatedEnv);
+  try {
+    await ensurePrivateDir(isolatedHome);
+    await copyFilePrivate(accountFile, isolatedPaths.authFile);
+    await copyOptionalFilePrivate(join(paths.home, 'config.toml'), join(isolatedHome, 'config.toml'));
+    const exitCode = await runCodex(codexArgs, {
+      ...spawnOptions,
+      env: isolatedEnv,
+    });
+    const authUpdated = await copyIsolatedAuthBack(accountFile, isolatedPaths);
+    return { exitCode, account: safeName, authUpdated };
+  } finally {
+    await rm(isolatedHome, { recursive: true, force: true });
+  }
 }
 
 export async function loginAccount(

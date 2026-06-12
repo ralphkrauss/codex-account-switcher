@@ -16,6 +16,7 @@ export {
   renameAccount,
   resolveExecutable,
   runCodex,
+  runCodexWithIsolatedAccount,
   saveAccount,
   switchAndRunCodex,
   useAccount,
@@ -34,6 +35,7 @@ export {
 
 export {
   DEFAULT_ONEPASSWORD_ITEM_PREFIX,
+  GDRIVE_BACKEND,
   ONEPASSWORD_AUTH_FIELD,
   ONEPASSWORD_BACKEND,
   REMOTE_CONFIG_VERSION,
@@ -41,18 +43,25 @@ export {
   autoPullAccountForUse,
   autoPushAccountIfChanged,
   configureOnePasswordRemote,
+  finishGoogleDriveOAuth,
   getRemoteConfigPath,
   inspectRemoteStatus,
   inspectSyncStatus,
   listRemoteAccountNames,
   readRemoteConfig,
   setupOnePasswordProfiles,
+  startGoogleDriveOAuth,
   syncPullAllAccounts,
   syncPullAccount,
   syncPushAllAccounts,
   syncPushAccount,
   writebackAndAutoPushCurrentAccount,
 } from './remote.js';
+
+export {
+  inspectAccountLimits,
+  inspectAllAccountLimits,
+} from './limits.js';
 
 export type {
   AccountEntry,
@@ -61,6 +70,7 @@ export type {
   CurrentMarker,
   DoctorReport,
   ForceOptions,
+  IsolatedRunResult,
   OperationOptions,
   RemoveResult,
   RenameResult,
@@ -80,6 +90,8 @@ export type {
 export type {
   ConfigureOnePasswordRemoteInput,
   ConfigureRemoteResult,
+  GoogleDriveRemoteConfig,
+  GoogleDriveStorage,
   OnePasswordRemoteConfig,
   RemoteBackend,
   RemoteCliOptions,
@@ -96,3 +108,10 @@ export type {
   SyncStatus,
   SyncStatusAccount,
 } from './remote.js';
+
+export type {
+  AccountLimits,
+  CreditsUsage,
+  LimitsOptions,
+  UsageWindow,
+} from './limits.js';

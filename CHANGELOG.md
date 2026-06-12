@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0 - 2026-06-12
+
+### Added
+
+- Add a Google Drive remote backend for saved Codex profiles. `cx backend setup gdrive oauth --client-secret <file> --auth-url` prints a browser authorization URL, and `cx backend setup gdrive oauth --auth-code <redirect-url-or-code>` completes the paste-code flow on headless/devbox machines.
+- Store Google Drive profiles in Drive `appDataFolder` by default, with optional `--folder-id <id>` for normal/shared folders and optional `CX_GDRIVE_ENCRYPTION_KEY` client-side encryption for remote file bodies.
+- Add backend-neutral `cx backend status`, `cx backend list`, and `cx backend setup ...` commands while keeping existing 1Password setup and `cx sync ...` workflows backward-compatible.
+- Add `cx limits <account>|--all [--json]` for best-effort Codex/ChatGPT usage-window telemetry. JSON mode is designed for orchestrators to choose an account before fan-out, and output avoids printing account tokens.
+- Add production-safe `cx run --account <name> -- ...` isolation. Each invocation copies the selected account into a temporary per-run `CODEX_HOME`, launches Codex there, then writes refreshed child auth back to `accounts/<name>.json` when safe, without changing shared `auth.json` or `.current-account`.
+- Add non-interactive run controls for orchestrators: `cx run` now closes child stdin by default when `cx` is not attached to a TTY, `--no-stdin` forces closed stdin, and `--stdin` / `--inherit-stdin` opt back in when stdin passthrough is intentional.
+- Add `cx run --timeout <seconds> -- ...`; on expiry, `cx` terminates the child process group and exits `124`.
+
+### Changed
+
+- Existing interactive and backward-compatible commands keep their old behavior: `cx run <name> -- ...` still switches shared state before launch, `cx run -- ...` still uses the current account, and `cx ls` / `cx use <name>` behavior is unchanged.
+- Package docs now include an orchestrator launch recipe using `cx run --account <name> --timeout <seconds> -- exec ...`, plus the branchable operational exit codes.
+
+### Fixed
+
+- Prevent non-interactive Codex runs from hanging their caller after Codex has finished but is still waiting for extra stdin.
+- Prevent an interactive `cx use <name>` on the same machine from swapping the shared `auth.json` underneath a live orchestrated `cx run --account <name>` invocation.
+- Map Codex stderr that looks like quota/rate-limit exhaustion (`usage limit`, `rate limit`, `quota`, `429`, etc.) to exit code `75`, so callers can branch without grepping stderr.
+
 ## 0.2.6 - 2026-06-08
 
 ### Added
