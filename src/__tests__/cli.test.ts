@@ -58,11 +58,11 @@ async function runCliWithOpenStdin(args: readonly string[], env: NodeJS.ProcessE
 }
 
 async function writeFakeCodex(path: string): Promise<void> {
-  const script = process.platform === 'win32'
-    ? '@echo off\r\n(for %%A in (%*) do echo %%~A) > "%CODEX_ARGS_FILE%"\r\n'
-    : `#!/bin/sh\nprintf '%s\\n' "${'$'}@" > "${'$'}CODEX_ARGS_FILE"\n`;
-  await writeFile(path, script);
-  await chmod(path, 0o755);
+  await writeNodeFakeCodex(path, `
+import { writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+writeFileSync(process.env.CODEX_ARGS_FILE, args.join('\\n') + (args.length ? '\\n' : ''));
+`);
 }
 
 async function readNormalized(path: string): Promise<string> {
@@ -213,11 +213,16 @@ test('cx login forwards Codex login flags such as --device-auth', async (t) => {
   await mkdir(bin, { recursive: true });
 
   const loginJson = JSON.stringify({ label: 'device-login', filler: 'x'.repeat(180) });
-  const fakeCodexScript = process.platform === 'win32'
-    ? `@echo off\r\n(for %%A in (%*) do echo %%~A) > "%CODEX_ARGS_FILE%"\r\nif "%1"=="login" (\r\n  > "%CODEX_HOME%\\auth.json" echo ${loginJson}\r\n  exit /b 0\r\n)\r\nexit /b 42\r\n`
-    : `#!/bin/sh\nset -eu\nprintf '%s\\n' "${'$'}@" > "${'$'}CODEX_ARGS_FILE"\nif [ "${'$'}1" = "login" ]; then\n  printf '%s\\n' '${loginJson}' > "${'$'}CODEX_HOME/auth.json"\n  exit 0\nfi\nexit 42\n`;
-  await writeFile(fakeCodex, fakeCodexScript);
-  await chmod(fakeCodex, 0o755);
+  await writeNodeFakeCodex(fakeCodex, `
+import { writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+writeFileSync(process.env.CODEX_ARGS_FILE, args.join('\\n') + (args.length ? '\\n' : ''));
+if (args[0] === 'login') {
+  writeFileSync(process.env.CODEX_HOME + '/auth.json', ${JSON.stringify(`${loginJson}\n`)});
+  process.exit(0);
+}
+process.exit(42);
+`);
 
   const result = runCli(['login', 'personal', '--device-auth'], {
     ...process.env,

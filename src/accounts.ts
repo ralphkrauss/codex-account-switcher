@@ -549,9 +549,18 @@ function killChildProcessGroup(child: ReturnType<typeof spawn>): void {
   }
 }
 
+interface CodexSpawnSpec {
+  readonly command: string;
+  readonly args: string[];
+  readonly windowsVerbatimArguments?: boolean;
+}
+
 function quoteWindowsShellPart(value: string): string {
-  const escaped = value.replace(/([()%!^"<>&|])/gu, '^$1');
-  if (escaped.length === 0 || /[\s()[\]{}^=;!'+,`~&|<>"]/u.test(value)) {
+  const escaped = value
+    .replace(/(\\*)"/gu, '$1$1\\"')
+    .replace(/\\+$/u, '$&$&')
+    .replace(/([()%!^&|<>])/gu, '^$1');
+  if (escaped.length === 0 || /[\s()[\]{}^=;!'+,`&|<>"]/u.test(value)) {
     return `"${escaped}"`;
   }
   return escaped;
@@ -561,15 +570,18 @@ function codexSpawnCommand(
   command: string,
   args: readonly string[],
   env: NodeJS.ProcessEnv,
-): { command: string; args: string[] } {
+): CodexSpawnSpec {
   if (process.platform !== 'win32') {
     return { command, args: [...args] };
   }
 
-  const commandLine = [command, ...args].map(quoteWindowsShellPart).join(' ');
+  const commandPart = quoteWindowsShellPart(command);
+  const commandLineBody = [commandPart, ...args.map(quoteWindowsShellPart)].join(' ');
+  const commandLine = commandPart.startsWith('"') ? `"${commandLineBody}"` : commandLineBody;
   return {
     command: env.ComSpec ?? env.COMSPEC ?? 'cmd.exe',
-    args: ['/d', '/s', '/v:off', '/c', commandLine],
+    args: ['/d', '/v:off', '/c', commandLine],
+    windowsVerbatimArguments: true,
   };
 }
 
@@ -596,6 +608,7 @@ export async function runCodex(
       env,
       stdio: [stdinMode, 'inherit', 'pipe'],
       windowsHide: false,
+      windowsVerbatimArguments: spawnSpec.windowsVerbatimArguments,
       detached,
     });
 
