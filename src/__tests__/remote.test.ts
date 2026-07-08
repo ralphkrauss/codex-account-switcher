@@ -359,6 +359,24 @@ test('sync push writes back refreshed live auth for the active account before up
   assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), refreshedAuth);
 });
 
+test('sync pull of the active account updates live auth to avoid stale writeback reversal', async (t) => {
+  const sandbox = await makeSandbox(t);
+  await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
+  const freshAuth = `${JSON.stringify({ account: 'work', token: 'fresh-remote', filler: 'x'.repeat(200) })}\n`;
+  const staleAuth = `${JSON.stringify({ account: 'work', token: 'stale-live', filler: 'x'.repeat(200) })}\n`;
+  const accountFile = await writeAccount(sandbox.paths, 'work', freshAuth);
+  await syncPushAccount('work', { paths: sandbox.paths, env: sandbox.env });
+
+  await writeFile(accountFile, staleAuth);
+  await useAccount('work', { paths: sandbox.paths });
+
+  const pulled = await syncPullAccount('work', { paths: sandbox.paths, env: sandbox.env, force: true });
+
+  assert.equal(pulled.overwritten, true);
+  assert.equal(await readFile(accountFile, 'utf8'), freshAuth);
+  assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), freshAuth);
+});
+
 test('sync push of an inactive account does not write back or corrupt the active slot', async (t) => {
   const sandbox = await makeSandbox(t);
   await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });

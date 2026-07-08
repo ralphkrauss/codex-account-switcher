@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-07-08
+
+### Fixed
+
+- Update live `auth.json` when `cx sync pull <active-account> --force` pulls the currently active profile, preventing stale live credentials from being written back over freshly pulled remote credentials on the next `cx use` or `cx <account>` invocation.
+
 ## 0.3.0 - 2026-06-12
 
 ### Added

@@ -1163,6 +1163,13 @@ async function writeLocalAccountAuthJson(
   return { account: safeAccount, accountFile, overwritten };
 }
 
+async function writeLiveAuthIfActive(account: string, authJson: string, paths: CodexPaths): Promise<void> {
+  const current = await readCurrentMarker(paths);
+  if (current.state === 'valid' && current.name === account) {
+    await writeFilePrivate(paths.authFile, authJson);
+  }
+}
+
 export async function syncPushAccount(
   account: string,
   options: RemoteCliOptions = {},
@@ -1207,6 +1214,7 @@ export async function syncPullAccount(
     ? remote.metadata
     : null;
   const local = await writeLocalAccountAuthJson(safeAccount, remote.authJson, paths, options.force === true);
+  await writeLiveAuthIfActive(safeAccount, remote.authJson, paths);
   await writeLocalSyncMetadata(paths, config, safeAccount, remote.authJson, verifiedMetadata);
 
   return {
