@@ -549,6 +549,30 @@ function killChildProcessGroup(child: ReturnType<typeof spawn>): void {
   }
 }
 
+function quoteWindowsShellPart(value: string): string {
+  const escaped = value.replace(/([()%!^"<>&|])/gu, '^$1');
+  if (escaped.length === 0 || /[\s()[\]{}^=;!'+,`~&|<>"]/u.test(value)) {
+    return `"${escaped}"`;
+  }
+  return escaped;
+}
+
+function codexSpawnCommand(
+  command: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+): { command: string; args: string[] } {
+  if (process.platform !== 'win32') {
+    return { command, args: [...args] };
+  }
+
+  const commandLine = [command, ...args].map(quoteWindowsShellPart).join(' ');
+  return {
+    command: env.ComSpec ?? env.COMSPEC ?? 'cmd.exe',
+    args: ['/d', '/s', '/v:off', '/c', commandLine],
+  };
+}
+
 export async function runCodex(
   codexArgs: readonly string[] = [],
   options: SpawnCodexOptions = {},
@@ -566,12 +590,12 @@ export async function runCodex(
     let timedOut = false;
     let timeout: NodeJS.Timeout | undefined;
     let killTimeout: NodeJS.Timeout | undefined;
-    const child = spawn(command, args, {
+    const spawnSpec = codexSpawnCommand(command, args, env);
+    const child = spawn(spawnSpec.command, spawnSpec.args, {
       cwd: options.cwd,
       env,
       stdio: [stdinMode, 'inherit', 'pipe'],
       windowsHide: false,
-      shell: process.platform === 'win32',
       detached,
     });
 

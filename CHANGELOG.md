@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 - 2026-07-08
+
+### Fixed
+
+- Preserve Codex arguments containing spaces on Windows when launching npm `.cmd` shims such as `codex.cmd`, including `cx resume <session> "follow up"` prompts.
+
 ## 0.3.1 - 2026-07-08
 
 ### Fixed
