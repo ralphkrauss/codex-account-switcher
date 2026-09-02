@@ -10,6 +10,7 @@ import {
   configureOnePasswordRemote,
   finishGoogleDriveOAuth,
   getCodexPaths,
+  hermesProfileForAccount,
   inspectAccountLimits,
   inspectAllAccountLimits,
   inspectHermesStatus,
@@ -17,12 +18,14 @@ import {
   inspectRemoteStatus,
   inspectSyncStatus,
   listAccounts,
+  loginHermesAccount,
   loginAccount,
   readCurrentMarker,
   removeAccount,
   renameAccount,
   runCodex,
   runCodexWithIsolatedAccount,
+  runHermesAccount,
   saveAccount,
   setupOnePasswordProfiles,
   startGoogleDriveOAuth,
@@ -34,8 +37,6 @@ import {
   useAccount,
   useHermesAccount,
   validateAccountName,
-  writebackCurrentAccount,
-  writebackAndAutoPushCurrentAccount,
   type AccountList,
   type DoctorReport,
   type HermesStatus,
@@ -44,6 +45,7 @@ import {
 } from './index.js';
 
 const PACKAGE_NAME = '@ralphkrauss/codex-account-switcher';
+const UNSAFE_PROFILE_IMPORT_ENV = 'CX_ALLOW_UNSAFE_PROFILE_IMPORT';
 const SUBCOMMANDS = new Set([
   '1password',
   'backend',
@@ -149,7 +151,6 @@ function helpText(metadata: { readonly name: string; readonly version: string })
 
 Usage:
   cx ls
-  cx save <name> [--force]
   cx use <name>
   cx login <name> [--force] [codex login args...]
   cx resume [codex resume args...]
@@ -157,55 +158,52 @@ Usage:
   cx rm <name>
   cx run [name] [--no-stdin] [--timeout <seconds>] -- [codex args...]
   cx run --account <name> [--no-stdin] [--timeout <seconds>] -- [codex args...]
-  cx hermes use <account> [--profile <name>] [--no-config]
-  cx hermes sync <account> [--profile <name>]
-  cx hermes status [--profile <name>] [--json]
-  cx 1password setup --vault <vault> [--item-prefix <prefix>] [--pull] [--force] [--use <account>]
+  cx hermes login <account> [--profile <name>]
+  cx hermes run <account> [--profile <name>] -- [hermes args...]
+  cx hermes status [account] [--profile <name>] [--json]
   cx backend status [--json]
-  cx backend list
-  cx backend setup 1password --vault <vault> [--item-prefix <prefix>]
-  cx backend setup gdrive oauth --client-secret <file> [--folder-id <id>] [--encryption env|none] --auth-url
-  cx backend setup gdrive oauth --auth-code <code-or-redirect-url>
   cx limits <account>|--all [--json]
   cx 1password status [--json]
-  cx remote configure 1password --vault <vault> [--item-prefix <prefix>]
   cx remote status [--json]
-  cx sync push <account>|--all
-  cx sync pull <account>|--all [--force]
   cx sync status [account] [--json]
+  cx save <name> [--force]                  (deprecated; disabled by default)
+  cx sync push|pull ...                     (deprecated; disabled by default)
   cx doctor [--json]
   cx --help
   cx --version
 
 Backward-friendly shortcuts:
-  cx <account> [codex args...]   switch to <account>, then run codex
-  cx                             run codex with the current auth.json when present
+  cx <account> [codex args...]   select <account>, then run its isolated Codex profile
+  cx                             run the currently selected isolated profile
 
 Data layout:
   Uses CODEX_HOME when set, otherwise ~/.codex.
-  Accounts are stored as CODEX_HOME/accounts/<name>.json.
+  Accounts are stable Codex homes at CODEX_HOME/accounts/<name>/.
+  Each profile owns its auth.json, config.toml, sessions, and refresh-token lineage.
   The active account marker is CODEX_HOME/.current-account.
-  Remote sync config is stored as CODEX_HOME/remote.json.
+  Legacy remote auth sync config is stored as CODEX_HOME/remote.json but credential
+  push/pull is disabled by default because active OAuth files are device-local.
 
 Account names may contain letters, numbers, dot, underscore, and dash only.`;
 }
 
 function hermesHelpText(): string {
   return `Usage:
-  cx hermes use <account> [--profile <name>] [--no-config]
-  cx hermes sync <account> [--profile <name>]
-  cx hermes status [--profile <name>] [--json]
+  cx hermes login <account> [--profile <name>]
+  cx hermes run <account> [--profile <name>] -- [hermes args...]
+  cx hermes status [account] [--profile <name>] [--json]
+  cx hermes use <account> ...     (deprecated and disabled)
+  cx hermes sync <account> ...    (deprecated and disabled)
 
 Commands:
-  use      Import CODEX_HOME/accounts/<account>.json into Hermes openai-codex auth.
-           If 1Password remote sync is configured, missing/remote-newer accounts auto-pull first.
-           Also sets model.provider=openai-codex unless --no-config is passed.
-  sync     Copy Hermes openai-codex tokens back to the cx account slot.
-           If 1Password remote sync is configured, the refreshed cx slot is pushed too.
-  status   Show the selected Hermes home, auth/config state, and linked cx account.
+  login    Run Hermes' native 'auth add openai-codex' flow. This creates a separate
+           refresh-token lineage instead of copying the Codex credential.
+  run      Run Hermes with the account's dedicated Hermes profile.
+  status   Show Hermes auth/config state without printing token contents.
+  use/sync Legacy token-copy bridge. Disabled unless CX_ALLOW_UNSAFE_HERMES_TOKEN_SHARE=1.
 
 Paths:
-  Default Hermes home uses HERMES_HOME when set, otherwise ~/.hermes.
+  By default account <name> maps to Hermes profile cx-<name>.
   --profile <name> explicitly targets ~/.hermes/profiles/<name>.`;
 }
 
@@ -219,7 +217,8 @@ Commands:
   status     Show configured backend/vault/prefix and whether the op CLI is available.
 
 Notes:
-  The default 1Password item prefix is cx-. Token contents are never printed.`;
+  This is read-only audit/configuration support for legacy remote sync.
+  Credential push/pull is deprecated and disabled by default. Token contents are never printed.`;
 }
 
 function backendHelpText(): string {
@@ -231,9 +230,9 @@ function backendHelpText(): string {
   cx backend setup gdrive oauth --auth-code <code-or-redirect-url>
 
 Commands:
-  status  Show the configured account backend.
+  status  Show the configured legacy account backend.
   list    List supported backends.
-  setup   Configure a backend. Google Drive OAuth uses a paste-code flow:
+  setup   Configure a deprecated recovery backend. Google Drive OAuth uses a paste-code flow:
           first run --auth-url, open the URL, then run --auth-code with the pasted redirect URL/code.`;
 }
 
@@ -251,12 +250,11 @@ function onePasswordHelpText(): string {
   cx 1password status [--json]
 
 Commands:
-  setup   Configure 1Password as the native profile backend, verify op/vault access,
-          optionally pull all remote profiles, and optionally select one profile.
-  status  Show 1Password backend status and local/remote profile presence.
+  setup   Configure legacy 1Password recovery. --pull requires the unsafe auth-sync override.
+  status  Audit 1Password and local/remote profile presence without revealing tokens.
 
 Examples:
-  cx 1password setup --vault Private --pull --use gi
+  cx 1password status
   cx 1password setup --vault Private --item-prefix codex-`;
 }
 
@@ -267,11 +265,8 @@ function syncHelpText(): string {
   cx sync status [account] [--json]
 
 Commands:
-  push    Upsert CODEX_HOME/accounts/<account>.json into the configured 1Password item.
-          With --all, push every local named account except reserved default.
-  pull    Read the configured 1Password item into CODEX_HOME/accounts/<account>.json.
-          With --all, pull every remote 1Password-backed profile not already local.
-          Refuses to overwrite unless --force is passed.
+  push    DEPRECATED: credential sharing is disabled by default.
+  pull    DEPRECATED: credential sharing is disabled by default.
   status  Compare local account-file presence with remote item presence without printing tokens.`;
 }
 
@@ -578,7 +573,7 @@ function requireArity(command: string, positionals: readonly string[], expected:
 function formatAccounts(list: AccountList): string {
   const lines = [`Codex accounts (home: ${list.home}):`];
   if (list.accounts.length === 0) {
-    lines.push('  (none yet — run: cx save <name> to register the current login, or cx login <name>)');
+    lines.push('  (none yet — run: cx login <name> --device-auth)');
   } else {
     for (const account of list.accounts) {
       lines.push(account.active ? `  * ${account.name}  (active)` : `    ${account.name}`);
@@ -586,7 +581,7 @@ function formatAccounts(list: AccountList): string {
   }
 
   if (list.currentMarker.state === 'invalid') {
-    lines.push('warning: .current-account is invalid; writeback will be skipped until fixed.');
+    lines.push('warning: .current-account is invalid; no named profile can be selected until it is fixed.');
   } else if (list.currentMarker.state === 'valid' && list.current === null) {
     lines.push(`warning: current marker '${list.currentMarker.name}' has no matching stored account.`);
   }
@@ -609,9 +604,13 @@ function formatDoctor(report: DoctorReport): string {
     `accounts dir exists: ${report.accountsDirExists ? 'yes' : 'no'}`,
     `accounts: ${report.accounts.length === 0 ? '(none)' : report.accounts.join(', ')}`,
     `current account: ${current}`,
-    `auth.json: ${report.authJson.exists ? `${report.authJson.size} bytes (${report.authJson.looksNonEmpty ? 'usable for save/writeback' : 'too small for save/writeback'})` : 'missing'}`,
+    `shared auth.json: ${report.authJson.exists ? `${report.authJson.size} bytes (${report.authJson.looksNonEmpty ? 'legacy fallback present' : 'too small for legacy fallback'})` : 'missing (normal with named profiles)'}`,
     `codex executable: ${report.codexExecutable ?? 'not found'}`,
   ];
+
+  for (const profile of report.profiles) {
+    lines.push(`profile ${profile.name}: ${profile.home} (${profile.authSize} auth bytes, file credential store=${yesNo(profile.fileCredentialStore)}, app-server socket=${yesNo(profile.appServerSocketExists)})`);
+  }
 
   if (report.current.reason) {
     lines.push(`current marker note: ${report.current.reason}`);
@@ -645,6 +644,7 @@ function formatHermesStatus(status: HermesStatus): string {
     `auth readable: ${yesNo(status.authReadable)}`,
     `openai-codex auth: ${status.openaiCodexAuthExists ? 'present' : 'missing'}`,
     `tokens: ${tokenBits}`,
+    `access token expires: ${status.accessTokenExpiresAt ?? '(unknown)'}${status.accessTokenExpired === null ? '' : status.accessTokenExpired ? ' (expired; refresh token may renew it)' : ' (current)'}`,
     `last refresh: ${status.lastRefresh ?? '(unknown)'}`,
     `auth mode: ${status.authMode ?? '(unknown)'}`,
     `credential pool openai-codex entries: ${status.poolEntryCount}`,
@@ -770,63 +770,10 @@ async function printList(io: CliIo, env: NodeJS.ProcessEnv): Promise<void> {
   write(io.stdout, formatAccounts(await listAccounts(getCodexPaths(env))));
 }
 
-async function maybeAutoPushCurrent(env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
-  const result = await writebackAndAutoPushCurrentAccount({ env, paths: getCodexPaths(env) });
-  if (result?.action === 'pushed') {
-    write(io.stdout, `auto-pushed profile '${result.account}'`);
-  }
-}
-
-async function maybeAutoPullCurrent(env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
-  const paths = getCodexPaths(env);
-  const current = await readCurrentMarker(paths);
-  if (current.state !== 'valid') {
-    return;
-  }
-  await writebackCurrentAccount({ paths });
-  const pull = await autoPullAccountForUse(current.name, { env, paths });
-  if (pull.action === 'pulled') {
-    await useAccount(current.name, { paths, skipWriteback: true });
-    write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
-  }
-}
-
-async function runCodexAndAutoPush(
-  args: readonly string[],
-  env: NodeJS.ProcessEnv,
-  io: CliIo,
-  options: { readonly stdin?: 'inherit' | 'ignore'; readonly timeoutSeconds?: number } = {},
-): Promise<number> {
-  await maybeAutoPullCurrent(env, io);
-  const exitCode = await runCodex(args, { env, stdin: options.stdin, timeoutSeconds: options.timeoutSeconds });
-  await maybeAutoPushCurrent(env, io);
-  return exitCode;
-}
-
 async function autoPushNamed(name: string, env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
   const result = await autoPushAccountIfChanged(name, { env, paths: getCodexPaths(env) });
   if (result.action === 'pushed') {
     write(io.stdout, `auto-pushed profile '${result.account}'`);
-  }
-}
-
-function isMissingRemoteBackendError(error: unknown): boolean {
-  if (!(error instanceof CxError)) {
-    return false;
-  }
-  return error.message.includes('remote backend is not configured')
-    || error.message.includes("1Password CLI ('op') was not found");
-}
-
-async function pushHermesSyncedAccountIfRemoteConfigured(name: string, env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
-  try {
-    const result = await syncPushAccount(name, { env, paths: getCodexPaths(env) });
-    write(io.stdout, `auto-pushed profile '${result.account}'`);
-  } catch (error) {
-    if (isMissingRemoteBackendError(error)) {
-      return;
-    }
-    throw error;
   }
 }
 
@@ -842,19 +789,54 @@ function displayBackendName(backend: string | undefined): string {
 
 async function useAccountWithRemoteFallback(name: string, env: NodeJS.ProcessEnv, io: CliIo): Promise<void> {
   const paths = getCodexPaths(env);
-  const current = await readCurrentMarker(paths);
-  const wasActive = current.state === 'valid' && current.name === name;
-  if (wasActive) {
-    await writebackCurrentAccount({ paths });
+  if (env.CX_ALLOW_UNSAFE_AUTH_SYNC === '1') {
+    const pull = await autoPullAccountForUse(name, { env, paths });
+    if (pull.action === 'pulled') {
+      write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
+    }
   }
-  const pull = await autoPullAccountForUse(name, { env, paths });
-  if (pull.action === 'pulled') {
-    write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
+  await useAccount(name, { paths });
+}
+
+async function runNamedProfile(
+  name: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  options: { readonly stdin?: 'inherit' | 'ignore'; readonly timeoutSeconds?: number } = {},
+): Promise<number> {
+  const paths = getCodexPaths(env);
+  if (env.CX_ALLOW_UNSAFE_AUTH_SYNC === '1') {
+    await autoPullAccountForUse(name, { env, paths });
   }
-  const writeback = await useAccount(name, { paths, skipWriteback: wasActive && pull.action === 'pulled' });
-  if (writeback.performed && writeback.account) {
-    await autoPushNamed(writeback.account, env, io);
+  await useAccount(name, { paths });
+  const result = await runCodexWithIsolatedAccount(name, args, {
+    env,
+    paths,
+    stdin: options.stdin,
+    timeoutSeconds: options.timeoutSeconds,
+  });
+  if (result.authUpdated && env.CX_ALLOW_UNSAFE_AUTH_SYNC === '1') {
+    await autoPushAccountIfChanged(name, { env, paths });
   }
+  return result.exitCode;
+}
+
+async function runCurrentProfile(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  io: CliIo,
+  options: { readonly stdin?: 'inherit' | 'ignore'; readonly timeoutSeconds?: number } = {},
+): Promise<number> {
+  const paths = getCodexPaths(env);
+  const marker = await readCurrentMarker(paths);
+  if (marker.state === 'valid') {
+    return await runNamedProfile(marker.name, args, env, options);
+  }
+  if (await authFileExists(paths)) {
+    write(io.stderr, "warning: no cx profile is selected; running shared CODEX_HOME/auth.json in deprecated compatibility mode. Run 'cx login <name>' first.");
+    return await runCodex(args, { env, stdin: options.stdin, timeoutSeconds: options.timeoutSeconds });
+  }
+  throw new CxError("no cx profile is selected; run 'cx login <name> --device-auth'", 1);
 }
 
 function parsePositiveInteger(value: string, option: string): number {
@@ -949,14 +931,37 @@ async function handleHermesCommand(
   }
 
   switch (command) {
+    case 'login': {
+      const parsed = parseHermesArgs('login <account> [--profile <name>]', rest, {});
+      requireArity('hermes login <account> [--profile <name>]', parsed.positionals, 1);
+      const account = parsed.positionals[0] ?? '';
+      const result = await loginHermesAccount(account, {
+        env,
+        ...(parsed.profile ? { profile: parsed.profile } : {}),
+      });
+      write(io.stdout, `Hermes profile '${result.profile}' now has an independent openai-codex login for cx account '${result.account}'`);
+      write(io.stdout, `hermes home: ${result.hermesHome}`);
+      write(io.stdout, `auth.json: ${result.authFile}`);
+      return 0;
+    }
+
+    case 'run': {
+      const separator = rest.indexOf('--');
+      const before = separator >= 0 ? rest.slice(0, separator) : rest;
+      const hermesArgs = separator >= 0 ? rest.slice(separator + 1) : [];
+      const parsed = parseHermesArgs('run <account> [--profile <name>] -- [hermes args...]', before, {});
+      requireArity('hermes run <account> [--profile <name>] -- [hermes args...]', parsed.positionals, 1);
+      const account = parsed.positionals[0] ?? '';
+      const profile = parsed.profile ?? hermesProfileForAccount(account);
+      write(io.stdout, `→ hermes profile '${profile}' for cx account '${account}'`);
+      return await runHermesAccount(account, hermesArgs, { env, profile });
+    }
+
     case 'use': {
       const parsed = parseHermesArgs('use <account> [--profile <name>] [--no-config]', rest, { noConfig: true });
       requireArity('hermes use <account> [--profile <name>] [--no-config]', parsed.positionals, 1);
       const account = parsed.positionals[0] ?? '';
-      const pull = await autoPullAccountForUse(account, { env, paths: getCodexPaths(env) });
-      if (pull.action === 'pulled') {
-        write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
-      }
+      write(io.stderr, 'warning: cx hermes use is deprecated and copies a rotating refresh token; use cx hermes login instead');
       const result = await useHermesAccount(account, {
         env,
         ...(parsed.profile ? { profile: parsed.profile } : {}),
@@ -975,6 +980,7 @@ async function handleHermesCommand(
       const parsed = parseHermesArgs('sync <account> [--profile <name>]', rest, {});
       requireArity('hermes sync <account> [--profile <name>]', parsed.positionals, 1);
       const account = parsed.positionals[0] ?? '';
+      write(io.stderr, 'warning: cx hermes sync is deprecated and copies a rotating refresh token; use independent cx hermes login profiles instead');
       const result = await syncHermesAccount(account, {
         env,
         ...(parsed.profile ? { profile: parsed.profile } : {}),
@@ -982,16 +988,20 @@ async function handleHermesCommand(
       write(io.stdout, `synced Hermes openai-codex tokens to cx account '${result.account}'`);
       write(io.stdout, `cx account file: ${result.codexAccountFile}`);
       write(io.stdout, `hermes home: ${result.hermesHome}`);
-      await pushHermesSyncedAccountIfRemoteConfigured(result.account, env, io);
       return 0;
     }
 
     case 'status': {
       const parsed = parseHermesArgs('status [--profile <name>] [--json]', rest, { json: true });
-      requireArity('hermes status [--profile <name>] [--json]', parsed.positionals, 0);
+      if (parsed.positionals.length > 1) {
+        throw new CxError('usage: cx hermes status [account] [--profile <name>] [--json]', 2);
+      }
+      const account = parsed.positionals[0];
+      const profile = parsed.profile ?? (account ? hermesProfileForAccount(account) : undefined);
       const status = await inspectHermesStatus({
         env,
-        ...(parsed.profile ? { profile: parsed.profile } : {}),
+        ...(profile ? { profile } : {}),
+        ...(account ? { account } : {}),
       });
       write(io.stdout, parsed.json ? JSON.stringify(status, null, 2) : formatHermesStatus(status));
       return 0;
@@ -1190,6 +1200,7 @@ async function handleSyncCommand(
 
   switch (command) {
     case 'push': {
+      write(io.stderr, 'warning: cx sync push is deprecated; credential sharing is enabled only for one-time recovery');
       requireArity('sync push <account>|--all', rest, 1);
       if (rest[0] === '--all') {
         const results = await syncPushAllAccounts({ env, paths: getCodexPaths(env) });
@@ -1207,6 +1218,7 @@ async function handleSyncCommand(
     }
 
     case 'pull': {
+      write(io.stderr, 'warning: cx sync pull is deprecated; credential sharing is enabled only for one-time recovery');
       let force = false;
       const positionals: string[] = [];
       for (const arg of rest) {
@@ -1276,14 +1288,15 @@ export async function main(
 
   if (!first) {
     const paths = getCodexPaths(env);
-    if (await authFileExists(paths)) {
-      return await runCodexAndAutoPush([], env, io);
+    const marker = await readCurrentMarker(paths);
+    if (marker.state === 'valid' || await authFileExists(paths)) {
+      return await runCurrentProfile([], env, io);
     }
 
     write(io.stdout, helpText(metadata));
     write(io.stdout, '');
-    write(io.stdout, `No live auth.json found at ${paths.authFile}.`);
-    write(io.stdout, 'Use cx ls, cx use <name>, cx save <name>, or cx login <name>.');
+    write(io.stdout, `No named profile or legacy shared auth.json was found under ${paths.home}.`);
+    write(io.stdout, 'Use cx login <name> --device-auth to create a profile locally.');
     write(io.stdout, '');
     write(io.stdout, formatAccounts(await listAccounts(paths)));
     return 0;
@@ -1297,7 +1310,7 @@ export async function main(
     validateAccountName(first);
     await useAccountWithRemoteFallback(first, env, io);
     write(io.stdout, `→ codex on '${first}'`);
-    return await runCodexAndAutoPush(rest, env, io);
+    return await runNamedProfile(first, rest, env);
   }
 
   switch (first) {
@@ -1313,9 +1326,18 @@ export async function main(
       const parsed = parseForceArgs(rest);
       requireArity('save <name> [--force]', parsed.positionals, 1);
       const name = parsed.positionals[0] ?? '';
+      if (env[UNSAFE_PROFILE_IMPORT_ENV] !== '1') {
+        throw new CxError(
+          `cx save is deprecated because copying a live auth.json creates two writers for one refresh token; use 'cx login ${name} --device-auth'. For a one-time ownership transfer only, set ${UNSAFE_PROFILE_IMPORT_ENV}=1 and stop every process using the source credential`,
+          1,
+        );
+      }
+      write(io.stderr, `warning: importing shared auth.json into '${name}' using unsafe one-time compatibility mode`);
       await saveAccount(name, { force: parsed.force, paths: getCodexPaths(env) });
       write(io.stdout, `saved current login as '${name}'`);
-      await autoPushNamed(name, env, io);
+      if (env.CX_ALLOW_UNSAFE_AUTH_SYNC === '1') {
+        await autoPushNamed(name, env, io);
+      }
       return 0;
     }
 
@@ -1329,22 +1351,21 @@ export async function main(
 
     case 'login': {
       const parsed = parseLoginArgs(rest);
-      const writeback = await loginAccount(parsed.name, {
+      await loginAccount(parsed.name, {
         force: parsed.force,
         loginArgs: parsed.loginArgs,
         env,
         paths: getCodexPaths(env),
       });
       write(io.stdout, `logged in and saved as '${parsed.name}'`);
-      if (writeback.performed && writeback.account) {
-        await autoPushNamed(writeback.account, env, io);
+      if (env.CX_ALLOW_UNSAFE_AUTH_SYNC === '1') {
+        await autoPushNamed(parsed.name, env, io);
       }
-      await autoPushNamed(parsed.name, env, io);
       return 0;
     }
 
     case 'resume': {
-      return await runCodexAndAutoPush(['resume', ...rest], env, io);
+      return await runCurrentProfile(['resume', ...rest], env, io);
     }
 
     case 'rename': {
@@ -1363,7 +1384,7 @@ export async function main(
       const result = await removeAccount(name, { paths: getCodexPaths(env) });
       write(io.stdout, `removed '${name}'`);
       if (result.wasActive) {
-        write(io.stderr, `warning: '${name}' was active; live auth.json was left in place until you switch or login.`);
+        write(io.stderr, `warning: '${name}' was selected; choose or log in another profile before running cx again.`);
       }
       return 0;
     }
@@ -1372,28 +1393,14 @@ export async function main(
       const parsed = parseRunArgs(rest);
       const runOptions = { stdin: parsed.stdin, timeoutSeconds: parsed.timeoutSeconds };
       if (parsed.isolatedAccount) {
-        const pull = await autoPullAccountForUse(parsed.isolatedAccount, { env, paths: getCodexPaths(env) });
-        if (pull.action === 'pulled') {
-          write(io.stdout, `auto-pulled ${displayBackendName(pull.backend)}-backed profile '${pull.account}'`);
-        }
-        write(io.stdout, `→ codex on isolated '${parsed.isolatedAccount}'`);
-        const result = await runCodexWithIsolatedAccount(parsed.isolatedAccount, parsed.codexArgs, {
-          env,
-          stdin: runOptions.stdin,
-          timeoutSeconds: runOptions.timeoutSeconds,
-          paths: getCodexPaths(env),
-          skipWriteback: pull.action === 'pulled',
-        });
-        if (result.authUpdated) {
-          await autoPushNamed(result.account, env, io);
-        }
-        return result.exitCode;
+        write(io.stdout, `→ codex on '${parsed.isolatedAccount}'`);
+        return await runNamedProfile(parsed.isolatedAccount, parsed.codexArgs, env, runOptions);
       }
       if (parsed.account) {
-        await useAccountWithRemoteFallback(parsed.account, env, io);
         write(io.stdout, `→ codex on '${parsed.account}'`);
+        return await runNamedProfile(parsed.account, parsed.codexArgs, env, runOptions);
       }
-      return await runCodexAndAutoPush(parsed.codexArgs, env, io, runOptions);
+      return await runCurrentProfile(parsed.codexArgs, env, io, runOptions);
     }
 
     case 'doctor': {

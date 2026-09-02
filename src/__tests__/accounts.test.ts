@@ -6,6 +6,7 @@ import test, { type TestContext } from 'node:test';
 import {
   accountPathForName,
   getCodexPaths,
+  inspectDoctor,
   listAccounts,
   loginAccount,
   removeAccount,
@@ -37,7 +38,7 @@ async function makeHome(t: TestContext): Promise<ReturnType<typeof getCodexPaths
   return getCodexPaths({ CODEX_HOME: home });
 }
 
-test('save, list, and use preserve refreshed auth with writeback', async (t) => {
+test('save creates stable profile homes and use never swaps shared auth.json', async (t) => {
   const paths = await makeHome(t);
   await mkdir(paths.home, { recursive: true });
 
@@ -49,9 +50,14 @@ test('save, list, and use preserve refreshed auth with writeback', async (t) => 
   await writeFile(paths.authFile, authPayload('personal-refreshed', 'personal-id'));
 
   const writeback = await useAccount('work', { paths });
-  assert.deepEqual(writeback, { performed: true, account: 'personal' });
-  assert.match(await readFile(accountPathForName(paths, 'personal'), 'utf8'), /personal-refreshed/);
-  assert.match(await readFile(paths.authFile, 'utf8'), /work-initial/);
+  assert.deepEqual(writeback, {
+    performed: false,
+    reason: 'selected stable profile without changing shared auth.json',
+    account: 'work',
+  });
+  assert.match(await readFile(accountPathForName(paths, 'personal'), 'utf8'), /personal-initial/);
+  assert.match(await readFile(paths.authFile, 'utf8'), /personal-refreshed/);
+  assert.match(await readFile(join(paths.accountsDir, 'work', 'config.toml'), 'utf8'), /cli_auth_credentials_store = "file"/u);
 
   const list = await listAccounts(paths);
   assert.deepEqual(list.accounts.map((account) => account.name), ['personal', 'work']);
@@ -64,31 +70,30 @@ test('save, list, and use preserve refreshed auth with writeback', async (t) => 
   }
 });
 
-test('writeback refuses to overwrite the current slot with a different Codex account_id', async (t) => {
+test('legacy migration preserves the refreshed live auth for the active matching account', async (t) => {
   const paths = await makeHome(t);
-  await mkdir(paths.home, { recursive: true });
+  await mkdir(paths.accountsDir, { recursive: true });
+  await writeFile(join(paths.accountsDir, 'gi.json'), authPayload('gi-initial', 'gi-id'));
+  await writeFile(paths.currentFile, 'gi\n');
+  await writeFile(paths.authFile, authPayload('gi-refreshed', 'gi-id'));
 
-  await writeFile(paths.authFile, authPayload('gi-initial', 'gi-id'));
-  await saveAccount('gi', { paths });
-  const giBefore = await readFile(accountPathForName(paths, 'gi'), 'utf8');
+  const list = await listAccounts(paths);
+  assert.deepEqual(list.accounts.map((entry) => entry.name), ['gi']);
+  assert.match(await readFile(accountPathForName(paths, 'gi'), 'utf8'), /gi-refreshed/u);
+  assert.equal(await exists(join(paths.accountsDir, 'gi.json')), false);
+  assert.match(await readFile(join(paths.accountsDir, '.legacy-v0.3', 'gi.json'), 'utf8'), /gi-initial/u);
+});
 
-  await writeFile(paths.authFile, authPayload('personal-initial', 'personal-id'));
-  await saveAccount('personal', { paths });
-  await useAccount('gi', { paths });
+test('legacy migration refuses a shared auth file from a different account id', async (t) => {
+  const paths = await makeHome(t);
+  await mkdir(paths.accountsDir, { recursive: true });
+  await writeFile(join(paths.accountsDir, 'gi.json'), authPayload('gi-initial', 'gi-id'));
+  await writeFile(paths.currentFile, 'gi\n');
+  await writeFile(paths.authFile, authPayload('personal-live', 'personal-id'));
 
-  // Simulates a raw `codex login` or other out-of-band auth mutation while
-  // .current-account still says `gi`. The next switch must not save that
-  // different OAuth account into gi.json.
-  await writeFile(paths.authFile, authPayload('personal-raw-login', 'personal-id'));
-
-  const writeback = await useAccount('personal', { paths });
-  assert.deepEqual(writeback, {
-    performed: false,
-    reason: 'live auth.json account_id does not match current account slot',
-    account: 'gi',
-  });
-  assert.equal(await readFile(accountPathForName(paths, 'gi'), 'utf8'), giBefore);
-  assert.match(await readFile(paths.authFile, 'utf8'), /personal-initial/);
+  await listAccounts(paths);
+  assert.match(await readFile(accountPathForName(paths, 'gi'), 'utf8'), /gi-initial/u);
+  assert.doesNotMatch(await readFile(accountPathForName(paths, 'gi'), 'utf8'), /personal-live/u);
 });
 
 test('save refuses to overwrite unless --force semantics are requested', async (t) => {
@@ -114,11 +119,12 @@ test('writeback skips a missing active slot instead of recreating it', async (t)
   await writeFile(paths.currentFile, 'ghost\n');
   await writeFile(paths.authFile, authPayload('ghost-refreshed'));
 
-  const writeback = await useAccount('other', { paths });
+  const writeback = await writebackCurrentAccount({ paths });
   assert.equal(writeback.performed, false);
   assert.equal(writeback.account, 'ghost');
   assert.equal(writeback.reason, 'current account slot no longer exists');
   assert.equal(await exists(accountPathForName(paths, 'ghost')), false);
+  await useAccount('other', { paths });
 });
 
 test('rename refuses collisions, force-overwrites, and updates active marker', async (t) => {
@@ -186,4 +192,20 @@ test('login runs codex login, saves resulting auth, and honors destination colli
     command: fakeCodex,
     env: { ...process.env, CODEX_HOME: paths.home },
   }), /already exists/);
+
+  const socketDir = join(paths.accountsDir, 'fresh', 'app-server-control');
+  await mkdir(socketDir, { recursive: true });
+  await writeFile(join(socketDir, 'app-server-control.sock'), 'stale socket marker');
+  await assert.rejects(() => loginAccount('fresh', {
+    paths,
+    force: true,
+    command: fakeCodex,
+    env: { ...process.env, CODEX_HOME: paths.home },
+  }), /stop the Codex app-server .* before logging in/u);
+  const doctor = await inspectDoctor(
+    { packageName: 'test', version: '0.0.0' },
+    { ...process.env, CODEX_HOME: paths.home },
+  );
+  assert.equal(doctor.profiles.find((profile) => profile.name === 'fresh')?.appServerSocketExists, true);
+  assert.ok(doctor.warnings.some((warning) => /app-server control socket/u.test(warning)));
 });

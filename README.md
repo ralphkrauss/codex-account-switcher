@@ -1,327 +1,262 @@
 # Codex Account Switcher
 
-`cx` is a small, installable CLI for switching native Codex CLI ChatGPT/OAuth accounts by swapping Codex's `auth.json` safely.
+`cx` runs each named Codex account from its own stable `CODEX_HOME`. It is designed for people who use several ChatGPT/Codex accounts on one device and want the same profile names on other devices without sharing rotating OAuth credentials.
 
-It keeps package code out of `~/.codex`; only account data lives there.
+Version 0.4 no longer switches accounts by copying `auth.json`. Every profile owns its credential file, configuration, sessions, app-server state, and refresh-token lineage.
+
+## Why this model
+
+Codex automatically refreshes ChatGPT OAuth credentials and writes the rotated bundle back to `auth.json`. OpenAI's operational guidance says to use one `auth.json` per machine or serialized workflow stream and not share it across concurrent jobs or multiple machines. See [Codex authentication](https://developers.openai.com/codex/auth/) and [CI/CD authentication guidance](https://learn.chatgpt.com/docs/auth/ci-cd-auth).
+
+That makes a copied credential a single-writer state file, not a portable account password. Two devices, two apps, or two concurrent processes that refresh copies of the same token can invalidate one another. `cx` therefore isolates writers and asks Codex and Hermes to authenticate independently.
 
 ## Install
 
 ```bash
-npm install -g @ralphkrauss/codex-account-switcher
-```
-
-Or try without installing:
-
-```bash
-npx -y @ralphkrauss/codex-account-switcher --help
+npm install -g @openai/codex @ralphkrauss/codex-account-switcher
 ```
 
 Requires Node.js 22+ and the native Codex CLI on `PATH`.
 
-## New personal device quick start
+## Quick start
 
-If your Codex profiles already exist in 1Password, a new machine should only need:
-
-```bash
-npm install -g @openai/codex @ralphkrauss/codex-account-switcher
-op signin
-cx 1password setup --vault <VAULT_NAME> --pull --use <PROFILE_NAME>
-cx doctor
-cx 1password status
-```
-
-Example:
+Create each profile locally:
 
 ```bash
-cx 1password setup --vault Codex --pull --use gi
+cx login personal --device-auth
+cx login gi --device-auth
+cx login beta --device-auth
+cx ls
 ```
 
-For a copy-pasteable prompt you can give another agent, plus macOS/Windows/Linux, bootstrap, headless EC2, and troubleshooting steps, see [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md).
+Run the TUI or a non-interactive command:
 
-Agent safety rule: do not paste or print `auth.json`, `accounts/*.json`, OAuth tokens, refresh tokens, Google OAuth token/client-secret files, encryption keys, or 1Password concealed-field contents. Use `cx doctor`, `cx backend status`, `cx 1password status`, `cx sync status`, `cx limits --all --json`, and `cx ls` for verification instead.
+```bash
+cx personal
+cx run gi -- exec "review the current changes"
+cx use beta
+cx                         # runs the selected beta profile
+cx resume --last
+```
+
+On another device, install `cx` and run the same `cx login <name> --device-auth` commands there. Reusing the names is fine; copying the files is not.
 
 ## Data layout
 
 `cx` uses `CODEX_HOME` when set, otherwise `~/.codex`:
 
 ```text
-~/.codex/auth.json                  # Codex's live auth file
-~/.codex/accounts/<name>.json       # saved account slots
-~/.codex/.current-account           # active account marker
-~/.codex/remote.json                # optional remote sync backend config
+~/.codex/
+├── .current-account
+├── accounts/
+│   ├── personal/
+│   │   ├── auth.json
+│   │   ├── config.toml
+│   │   ├── sessions/
+│   │   └── app-server-control/
+│   ├── gi/
+│   │   ├── auth.json
+│   │   └── config.toml
+│   └── beta/
+│       ├── auth.json
+│       └── config.toml
+└── auth.json                    # optional deprecated shared/root login
 ```
 
-On POSIX, newly-created directories are `0700` and credential copies are `0600` where supported.
+Each profile config is pinned to:
 
-## Usage
+```toml
+cli_auth_credentials_store = "file"
+```
+
+This is necessary because Codex can otherwise choose the OS keyring, which is not scoped by `CODEX_HOME`. Newly created credential files use private permissions where the platform supports them, and writes are atomic.
+
+## Commands
 
 ```bash
 cx ls
-cx save personal
-cx save personal --force
-cx login work
-cx login personal --force --device-auth
-cx login work -- --with-api-key
-cx use work
-cx resume 019ea2b1-5d71-7d30-b625-f43158d13be8
-cx resume --last
-cx run work -- exec "fix the tests"
-cx run --account work --timeout 1800 -- exec --json --output-last-message /tmp/final.md "fix the tests"
-cx run --no-stdin -- exec "non-interactive prompt"
-cx run -- --help
-cx hermes use work
-cx hermes status
-cx hermes sync work
-cx 1password setup --vault Private --pull --use work
-cx backend setup gdrive oauth --client-secret ./client-secret.json --auth-url
-cx backend setup gdrive oauth --auth-code '<redirect-url-or-code>'
-cx backend status
-cx limits --all --json
-cx 1password status
-cx sync push --all
-cx sync pull --all
-cx sync status work
-cx rename work work-prod
-cx rm work-prod
-cx doctor
+cx login <name> [--force] [codex login args...]
+cx use <name>
+cx <name> [codex args...]
+cx run [name] [--no-stdin] [--timeout <seconds>] -- [codex args...]
+cx run --account <name> [--no-stdin] [--timeout <seconds>] -- [codex args...]
+cx resume [codex resume args...]
+cx rename <old> <new> [--force]
+cx rm <name>
+cx limits <name>|--all [--json]
+cx doctor [--json]
+
+cx hermes login <account> [--profile <name>]
+cx hermes run <account> [--profile <name>] -- [hermes args...]
+cx hermes status [account] [--profile <name>] [--json]
 ```
 
-Backward-friendly shortcut:
+Account names may contain letters, numbers, `.`, `_`, and `-` only.
+
+## Writer safety and concurrency
+
+`cx` holds an exclusive lock for the full lifetime of Codex or Hermes when that process can use a profile's Codex state. A second writer to the same profile exits with an actionable error.
+
+Different profiles can run concurrently:
 
 ```bash
-cx work exec "fix the tests"
+cx run gi-worker-1 -- exec "task one"
+cx run gi-worker-2 -- exec "task two"
 ```
 
-This switches to `work`, then launches `codex exec "fix the tests"`.
-
-Resume Codex sessions the same way you normally would with `codex resume`, but through the active `cx` profile:
+Create worker profiles with separate logins, even if they sign in to the same ChatGPT account:
 
 ```bash
-cx resume <session-id>
-cx resume --last
-cx resume <session-id> "follow up prompt"
+cx login gi-worker-1 --device-auth
+cx login gi-worker-2 --device-auth
 ```
 
-Use the existing account-prefixed shortcut when you want to resume under a specific profile in one command:
+Do not clone `gi` into the worker profiles. Separate logins create separate credential ownership; copied files recreate the refresh race.
 
-```bash
-cx work resume <session-id>
-```
-
-`cx` with no args launches `codex` if a live `auth.json` exists. If not, it prints setup guidance.
-
-## Account names
-
-Names must contain only:
-
-```text
-A-Z a-z 0-9 . _ -
-```
-
-Empty names, dot-only names, slashes, backslashes, spaces, unicode, and path traversal are rejected.
-
-## Behavior notes
-
-- Before switching or logging in, `cx` writes the live `auth.json` back to the current saved slot if it is valid and still exists. This preserves token refreshes.
-- Writeback never recreates a deleted active slot.
-- `cx rm <active>` removes the saved slot and clears `.current-account`; it leaves live `auth.json` untouched until you switch or login.
-- `cx save` and `cx rename` refuse overwrites unless `--force` is passed.
-- `cx login <name>` forwards extra arguments to `codex login`, so headless flows such as `cx login personal --force --device-auth` work on remote machines; use `--force` when refreshing an existing saved profile.
-- `cx run --account <name> -- ...` uses a per-invocation isolated `CODEX_HOME`; it does not swap shared `auth.json`, so concurrent orchestrated runs and interactive `cx use` calls cannot affect each other.
-- `cx run` closes child stdin by default when `cx` itself is not attached to a TTY. Use `--no-stdin` to force that behavior, or `--stdin`/`--inherit-stdin` when you intentionally need to pass stdin through.
-- `cx run --timeout <seconds> -- ...` terminates the child process group and exits `124` on timeout. Codex stderr that looks like quota/rate-limit exhaustion maps to exit `75`.
-- `cx doctor`, `cx remote status`, and `cx sync status` never print token contents.
-
-## Orchestrated non-interactive runs
-
-For mission orchestrators or other fan-out runners, prefer the isolated form:
-
-```bash
-cx run --account <name> --timeout 1800 -- exec \
-  -c model=gpt-5.1-codex-max \
-  --cd <worktree> \
-  --sandbox workspace-write \
-  --json \
-  --output-last-message <file> \
-  "<prompt>"
-```
-
-This copies the selected account into a temporary per-run `CODEX_HOME`, launches Codex there, then writes any refreshed child auth back to `accounts/<name>.json` without changing the shared live `auth.json` or `.current-account`. Existing interactive commands such as `cx use personal` remain global/shared by design, but they cannot alter already-running isolated invocations.
-
-Operational exit codes for callers:
+For orchestrators, `--no-stdin`, `--timeout`, and the exit codes are useful:
 
 - `0`: Codex completed successfully.
-- `75`: stderr looked like quota/rate-limit exhaustion (`usage limit`, `rate limit`, `quota`, `429`, etc.).
-- `124`: `--timeout` expired and `cx` terminated the child process group.
-- Other non-zero: normal Codex/process failure.
+- `75`: Codex stderr looked like quota or rate-limit exhaustion.
+- `124`: the timeout expired and `cx` terminated the child process group.
+- Other non-zero values: normal Codex/process failure.
 
 ## Hermes integration
 
-`cx` can seed Hermes' existing `openai-codex` auth store from a saved cx account without changing or forking Hermes:
+Hermes intentionally keeps its `openai-codex` OAuth session separate from Codex. Its own documentation says the two sessions should not share OAuth state because either client may refresh and clobber the other. See the [Hermes Codex runtime guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/codex-app-server-runtime.md).
+
+Authenticate Hermes independently for the corresponding cx account:
 
 ```bash
-cx hermes use work                  # import ~/.codex/accounts/work.json into ~/.hermes/auth.json
-cx hermes use work --profile team   # target ~/.hermes/profiles/team/auth.json
-cx hermes use work --no-config      # import auth only; leave config.yaml untouched
-cx hermes status                    # show auth/config state without printing token values
-cx hermes sync work                 # copy refreshed Hermes tokens back to the cx account slot
+cx hermes login gi
+cx hermes status gi
+cx hermes run gi -- chat
 ```
 
-`cx hermes use` writes `providers.openai-codex.tokens` and a `credential_pool.openai-codex` entry labelled `cx:<account>`. By default it also sets `model.provider: openai-codex` in Hermes' `config.yaml`. If 1Password remote sync is configured, `cx hermes use` auto-pulls the named account when the local slot is missing or safely behind remote.
-
-`cx hermes sync` is the manual writeback path: if Hermes refreshes the token in `~/.hermes/auth.json`, this copies that refreshed pair back into `~/.codex/accounts/<account>.json`. If 1Password remote sync is configured, it also pushes the refreshed slot back to 1Password.
-
-## Google Drive-backed profiles
-
-`cx` can also use Google Drive as the remote profile backend. The default OAuth flow stores profile files in Drive `appDataFolder` so no folder choice is required; pass `--folder-id <id>` if you want a normal/shared folder instead.
-
-Headless/devbox setup uses a paste-code OAuth flow:
-
-```bash
-cx backend setup gdrive oauth --client-secret ./client-secret.json --auth-url
-# Open the printed URL, approve access, then paste the resulting redirect URL or code:
-cx backend setup gdrive oauth --auth-code '<redirect-url-or-code>'
-```
-
-Optional client-side encryption is available without changing the sync workflow:
-
-```bash
-export CX_GDRIVE_ENCRYPTION_KEY='your-shared-passphrase'
-cx backend setup gdrive oauth --client-secret ./client-secret.json --encryption env --auth-url
-```
-
-After setup, the existing sync commands are backend-neutral:
-
-```bash
-cx sync push work
-cx sync pull work
-cx sync status work
-cx backend status
-```
-
-`cx limits <account>|--all [--json]` reports normalized Codex/ChatGPT usage windows for saved profiles. It uses Codex's internal ChatGPT usage endpoint on a best-effort basis, so treat it as operational telemetry rather than a stable public API.
-
-## 1Password-backed profiles
-
-`cx` can use 1Password as a native profile backend through the 1Password CLI (`op`). This is intended for moving Codex auth between machines without committing secrets to git or publishing them to npm.
-
-Full setup documentation for personal devices and delegated agent setup is in [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md). It includes a prompt you can give your agent, OS-specific installation notes, first-machine bootstrapping, headless/service-account setup, and troubleshooting.
-
-Prerequisites:
-
-- Install 1Password CLI v2 (`op`) on each machine.
-- Sign in first with `op signin`, or set `OP_SERVICE_ACCOUNT_TOKEN` for non-interactive hosts such as EC2.
-- Create or choose a vault where the items should live.
-
-Easy setup on a new machine:
-
-```bash
-cx 1password setup --vault Private --pull --use work
-```
-
-That one command:
-
-1. writes `~/.codex/remote.json` with the 1Password vault/prefix settings,
-2. verifies that `op` can access the vault,
-3. discovers remote `cx-*` profile items,
-4. pulls missing profiles locally, and
-5. selects the requested profile with `cx use`.
-
-If you do not want to pull immediately:
-
-```bash
-cx 1password setup --vault Private
-```
-
-After setup, remote-backed profiles behave naturally:
-
-```bash
-cx use work              # auto-pulls work from 1Password when remote is newer or local is missing
-cx run work -- exec ...  # auto-pulls before launching Codex, then auto-pushes refreshed auth after Codex exits
-cx login work --force --device-auth # refreshes an existing profile and auto-pushes it to 1Password
-cx 1password status      # local + remote profile presence and sync state, no token contents
-```
-
-The auto-sync layer is conservative:
-
-- Remote-backed credentials are tracked with non-secret SHA-256 metadata.
-- `cx` auto-pulls when the remote changed and the local copy is still at the last synced hash.
-- `cx` auto-pushes after `cx save`, `cx login`, `cx run`, shortcut `cx <profile> ...`, and `cx hermes sync` when the local profile changed.
-- If local and remote both changed, `cx` refuses to overwrite either side and asks for explicit conflict resolution.
-- Set `CX_AUTO_SYNC=0` to temporarily disable magic sync while keeping explicit `cx sync ...` commands available.
-
-The legacy lower-level commands are still available:
-
-```bash
-cx remote configure 1password --vault Private
-cx remote configure 1password --vault Private --item-prefix codex-
-cx remote status
-```
-
-Push local profiles to 1Password:
-
-```bash
-cx sync push work
-cx sync push --all
-```
-
-Pull profiles onto another machine:
-
-```bash
-cx sync pull work
-cx sync pull work --force
-cx sync pull --all
-cx sync pull --all --force
-```
-
-`pull --all` pulls every remote 1Password-backed profile that is not already local. Use `--force` to overwrite existing local profile slots.
-
-Compare local and remote presence without printing auth JSON:
-
-```bash
-cx sync status
-cx sync status work
-cx sync status work --json
-```
-
-Remote sync is for named account slots only. `default` is reserved as the live Codex auth target: choose which named account should be active/default on a machine with `cx use <name>`, rather than syncing a separate `default` profile.
-
-1Password storage details: `cx` shells out to `op` with argv arrays. Reads prefer `op item get <item> --vault <vault> --format json` and extract the concealed `auth_json` field safely for multiline JSON. Writes use a `Secure Note` item with a concealed field named `auth_json` via `op item create ... --category "Secure Note" ... auth_json[concealed]=<json>` and `op item edit ... auth_json[concealed]=<json>`. Status commands only report presence/configuration and never reveal field contents.
-
-## Migrating from the prototype shell function
-
-If you previously had `/home/ubuntu/.codex/codex-acct.sh` sourced from `.bashrc`:
-
-1. Install this package globally.
-2. Remove the marked `.bashrc` block that sources `~/.codex/codex-acct.sh`.
-3. Delete only the old script:
-
-```bash
-rm -f ~/.codex/codex-acct.sh
-```
-
-Keep these files/directories:
+By default, account `gi` maps to Hermes profile `cx-gi`. `cx hermes login gi` runs Hermes's native flow:
 
 ```text
-~/.codex/auth.json
-~/.codex/accounts/
-~/.codex/.current-account
+hermes --profile cx-gi auth add openai-codex
 ```
 
-They are the data this package uses.
+Complete that login as the same ChatGPT account/workspace used by the cx profile. When token claims expose an account ID, `cx` rejects a detected mismatch.
 
-## Uninstall
+`cx hermes run gi` supplies both:
+
+- Hermes profile `~/.hermes/profiles/cx-gi`
+- Codex profile `~/.codex/accounts/gi` as `CODEX_HOME`
+
+This matters if Hermes uses its Codex app-server runtime: the runtime consumes Codex's session, while Hermes's direct `openai-codex` provider consumes Hermes's independent session.
+
+`cx hermes status` reports token presence and the access-token expiry when it can derive one. It does not contact the provider, so only an actual Hermes request can prove that a refresh token is accepted.
+
+## Upgrading from 0.3
+
+Stop Codex, Hermes, and any Codex app-server processes using these profiles, then upgrade:
 
 ```bash
-npm uninstall -g @ralphkrauss/codex-account-switcher
+npm install -g @ralphkrauss/codex-account-switcher@latest
+cx ls
+cx doctor
 ```
 
-This removes the CLI only. It does not remove your Codex credentials.
+The first `cx ls`, `cx use`, or run migrates legacy files automatically:
 
-To remove stored account slots too:
+```text
+accounts/gi.json       -> accounts/gi/auth.json
+accounts/personal.json -> accounts/personal/auth.json
+```
+
+Original flat files are archived under `accounts/.legacy-v0.3/`. If the active legacy slot and shared `auth.json` contain the same explicit Codex account ID, migration keeps the live file so a newer locally refreshed token is not lost.
+
+Legacy sessions remain in the old root home because `cx` cannot prove which account owns each session. New sessions are profile-scoped. Move a known session only after making a backup and verifying its account; do not link one writable sessions directory into several profiles.
+
+After migration:
+
+1. Run `cx doctor` and confirm each profile says `file credential store=yes`.
+2. Test each profile with `cx run <name> -- --version` or a small request.
+3. On every other device, log in locally instead of pulling a credential copy.
+4. For every Hermes profile, run `cx hermes login <name>` once.
+
+## Deprecated credential-copy features
+
+These commands remain recognizable for migration and emergency recovery, but are disabled by default:
+
+- `cx save`: copied the shared/root `auth.json` into a named profile.
+- `cx sync push` / `cx sync pull`: copied active OAuth state through 1Password or Google Drive.
+- automatic remote pull/push (formerly “magic sync”).
+- `cx hermes use` / `cx hermes sync`: copied one rotating token family between Codex and Hermes.
+
+Read-only backend and sync status commands remain available so existing installations can be audited without revealing tokens.
+
+Break-glass environment variables exist for a one-time ownership transfer only:
 
 ```bash
-rm -rf ~/.codex/accounts ~/.codex/.current-account
+CX_ALLOW_UNSAFE_PROFILE_IMPORT=1 cx save <name>
+CX_ALLOW_UNSAFE_AUTH_SYNC=1 cx sync pull <name> --force
+CX_ALLOW_UNSAFE_HERMES_TOKEN_SHARE=1 cx hermes use <name>
 ```
 
-Do not delete `~/.codex/auth.json` unless you want to log Codex out.
+Do not export these permanently. Before using one, stop every process and device that could use the source credential. After transferring it, retire the source copy.
+
+## Troubleshooting
+
+### Refresh token reused, invalidated, revoked, or expired
+
+Stop every Codex/Hermes process using the affected profile and authenticate that profile again:
+
+```bash
+cx login gi --force --device-auth
+```
+
+If this keeps happening, look for a raw `codex` invocation, IDE/desktop app, old remote copy, or another device using the same credential. `cx` cannot repair a refresh-token family that another writer has already rotated or revoked.
+
+### Login blocked by an app-server socket
+
+`cx login --force` refuses to replace a profile credential while that profile has an app-server control socket. Find and stop the matching process first:
+
+```bash
+ps aux | grep '[c]odex app-server'
+kill <PID>
+rm -f ~/.codex/accounts/<name>/app-server-control/app-server-control.sock
+cx login <name> --force --device-auth
+```
+
+Remove the socket only after its process has stopped. `cx doctor` reports profile-scoped app-server sockets. A daemon in the old shared/root `~/.codex` does not affect named v0.4 profiles because they use different `CODEX_HOME` directories.
+
+### Hermes shows the wrong account
+
+Use one Hermes profile per cx account and reauthenticate it independently:
+
+```bash
+cx hermes login gi --profile cx-gi
+cx hermes status gi --profile cx-gi
+```
+
+The deprecated multi-account token-copy bridge is disabled. Its recovery writeback also fails closed when credential ownership is ambiguous.
+
+If `hermes auth add openai-codex` succeeds but Hermes later reports a missing provider access token, upgrade Hermes and check [Hermes issue #32730](https://github.com/NousResearch/hermes-agent/issues/32730). Some Hermes versions have a split between their credential pool and legacy provider state. Do not work around that upstream bug by copying Codex's credential into Hermes.
+
+### Secret handling
+
+Treat every `auth.json` like a password. Do not commit it, paste it into chat/issues, include it in logs, or store it as a public artifact. Safe diagnostics include:
+
+```bash
+cx doctor
+cx ls
+cx limits --all --json
+cx hermes status gi --json
+cx sync status
+```
+
+## Development
+
+```bash
+pnpm install
+pnpm verify
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [PUBLISHING.md](PUBLISHING.md), and [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT. See [LICENSE.md](LICENSE.md).

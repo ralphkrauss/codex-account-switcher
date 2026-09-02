@@ -119,11 +119,11 @@ test('cx with no auth shows help and account guidance instead of launching codex
   const home = await makeHome(t);
   const result = runCli([], { ...process.env, CODEX_HOME: home, PATH: '' });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /No live auth\.json found/);
-  assert.match(result.stdout, /cx use <name>/);
+  assert.match(result.stdout, /No named profile or legacy shared auth\.json was found/u);
+  assert.match(result.stdout, /cx login <name> --device-auth/u);
 });
 
-test('backward cx <account> switches then launches codex with remaining args', async (t) => {
+test('backward cx <account> launches the stable profile without swapping shared auth', async (t) => {
   const home = await makeHome(t);
   const bin = join(home, 'bin');
   const argsFile = join(home, 'codex-args.txt');
@@ -142,7 +142,8 @@ test('backward cx <account> switches then launches codex with remaining args', a
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /→ codex on 'work'/);
   assert.equal(await readNormalized(argsFile), 'exec\nhello\n');
-  assert.match(await readFile(join(home, 'auth.json'), 'utf8'), /work-account/);
+  assert.equal(existsSync(join(home, 'auth.json')), false);
+  assert.match(await readFile(join(home, 'accounts', 'work', 'auth.json'), 'utf8'), /work-account/);
   assert.equal((await readFile(join(home, '.current-account'), 'utf8')).trim(), 'work');
 });
 
@@ -233,7 +234,7 @@ process.exit(42);
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readNormalized(argsFile), 'login\n--device-auth\n');
-  assert.match(await readFile(join(home, 'accounts', 'personal.json'), 'utf8'), /device-login/);
+  assert.match(await readFile(join(home, 'accounts', 'personal', 'auth.json'), 'utf8'), /device-login/);
   assert.equal((await readFile(join(home, '.current-account'), 'utf8')).trim(), 'personal');
 });
 
@@ -247,7 +248,7 @@ async function writeNodeFakeCodex(bin: string, script: string): Promise<void> {
   await chmod(bin, 0o755);
 }
 
-test('cx run --account uses an isolated CODEX_HOME and does not mutate shared auth state', async (t) => {
+test('cx run --account uses a stable profile CODEX_HOME and does not mutate shared auth state', async (t) => {
   const home = await makeHome(t);
   const bin = join(home, 'bin');
   const argsFile = join(home, 'isolated-args.txt');
@@ -280,11 +281,61 @@ writeFileSync(process.env.CODEX_HOME + '/auth.json', JSON.stringify({ label: 'wo
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readNormalized(argsFile), 'exec\nprompt\n');
   const childHome = (await readFile(childHomeFile, 'utf8')).trim();
-  assert.notEqual(childHome, home);
+  assert.equal(childHome, join(home, 'accounts', 'work'));
   assert.match(await readFile(childAuthFile, 'utf8'), /work-account/);
   assert.match(await readFile(join(home, 'auth.json'), 'utf8'), /shared-live/);
-  assert.equal((await readFile(join(home, '.current-account'), 'utf8')).trim(), 'personal');
-  assert.match(await readFile(join(home, 'accounts', 'work.json'), 'utf8'), /work-refreshed/);
+  assert.equal((await readFile(join(home, '.current-account'), 'utf8')).trim(), 'work');
+  assert.match(await readFile(join(home, 'accounts', 'work', 'auth.json'), 'utf8'), /work-refreshed/);
+});
+
+test('cx rejects concurrent writers to the same stable profile', async (t) => {
+  const home = await makeHome(t);
+  const bin = join(home, 'bin');
+  const startedFile = join(home, 'started.txt');
+  const profileHome = join(home, 'accounts', 'work');
+  const fakeCodex = join(bin, process.platform === 'win32' ? 'codex.cmd' : 'codex');
+  await mkdir(profileHome, { recursive: true });
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(profileHome, 'auth.json'), authPayload('work-account'));
+  await writeNodeFakeCodex(fakeCodex, `
+import { writeFileSync } from 'node:fs';
+writeFileSync(process.env.CODEX_STARTED_FILE, 'started');
+setTimeout(() => process.exit(0), 1_000);
+`);
+  const env = {
+    ...process.env,
+    CODEX_HOME: home,
+    CODEX_STARTED_FILE: startedFile,
+    PATH: [bin, process.env.PATH ?? ''].join(delimiter),
+  };
+
+  const first = runCliWithOpenStdin(['run', 'work', '--', 'exec'], env, 4_000);
+  for (let attempt = 0; attempt < 100 && !existsSync(startedFile); attempt += 1) {
+    await delay(20);
+  }
+  assert.equal(existsSync(startedFile), true, 'first profile process did not start');
+
+  const second = runCli(['run', 'work', '--', 'exec'], env);
+  assert.notEqual(second.status, 0);
+  assert.match(second.stderr, /already in use by cx process/u);
+
+  const completed = await first;
+  assert.equal(completed.status, 0, completed.stderr);
+  assert.equal(existsSync(join(profileHome, '.cx-profile.lock')), false);
+});
+
+test('unsafe credential-copy commands are disabled by default', async (t) => {
+  const home = await makeHome(t);
+  await writeFile(join(home, 'auth.json'), authPayload('shared-login'));
+
+  const save = runCli(['save', 'work'], { ...process.env, CODEX_HOME: home });
+  assert.notEqual(save.status, 0);
+  assert.match(save.stderr, /cx save is deprecated/u);
+  assert.equal(existsSync(join(home, 'accounts', 'work', 'auth.json')), false);
+
+  const sync = runCli(['sync', 'push', 'work'], { ...process.env, CODEX_HOME: home });
+  assert.notEqual(sync.status, 0);
+  assert.match(sync.stderr, /remote auth\.json push\/pull is disabled/u);
 });
 
 test('cx run closes child stdin by default when cx stdin is not a TTY', async (t) => {

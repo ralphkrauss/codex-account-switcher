@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test, { type TestContext } from 'node:test';
 import {
@@ -88,7 +88,14 @@ async function makeSandbox(t: TestContext): Promise<Sandbox> {
   await mkdir(bin, { recursive: true });
   await writeNodeCommand(bin, 'op', FAKE_OP_SCRIPT);
   await writeNodeCommand(bin, 'codex', FAKE_CODEX_SCRIPT);
-  const env = { ...process.env, CODEX_HOME: codexHome, OP_FAKE_STORE: storeFile, PATH: [bin, process.env.PATH ?? ''].join(delimiter) };
+  const env = {
+    ...process.env,
+    CODEX_HOME: codexHome,
+    OP_FAKE_STORE: storeFile,
+    CX_ALLOW_UNSAFE_AUTH_SYNC: '1',
+    CX_ALLOW_UNSAFE_PROFILE_IMPORT: '1',
+    PATH: [bin, process.env.PATH ?? ''].join(delimiter),
+  };
   return { root, env, storeFile, paths: getCodexPaths(env) };
 }
 
@@ -119,6 +126,7 @@ function sha256Hex(value: string): string {
 async function writeAccount(paths: ReturnType<typeof getCodexPaths>, account: string, authJson: string): Promise<string> {
   await mkdir(paths.accountsDir, { recursive: true });
   const file = accountPathForName(paths, account);
+  await mkdir(dirname(file), { recursive: true });
   await writeFile(file, authJson);
   return file;
 }
@@ -196,7 +204,7 @@ test('cx use auto-pulls remote-newer auth only when local copy is unchanged sinc
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /auto-pulled .*profile 'work'/u);
   assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), remoteNewer);
-  assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), remoteNewer);
+  await assert.rejects(() => readFile(sandbox.paths.authFile, 'utf8'), /ENOENT/u);
   await assertLocalSyncHash(sandbox.paths, 'work', remoteNewer);
 });
 
@@ -241,7 +249,7 @@ test('cx use of the already-active profile does not reverse an auto-pulled remot
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /auto-pulled 1Password-backed profile 'work'/u);
   assert.doesNotMatch(result.stdout, /auto-pushed profile 'work'/u);
-  assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), remoteNewer);
+  await assert.rejects(() => readFile(sandbox.paths.authFile, 'utf8'), /ENOENT/u);
   assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), remoteNewer);
   assert.equal(storedAuthJson(await readStore(sandbox.storeFile), 'cx-work'), remoteNewer);
   await assertLocalSyncHash(sandbox.paths, 'work', remoteNewer);
@@ -266,7 +274,7 @@ test('cx run without an account auto-pulls the active profile before launching c
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readFile(snapshotFile, 'utf8'), remoteNewer);
-  assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), remoteNewer);
+  await assert.rejects(() => readFile(sandbox.paths.authFile, 'utf8'), /ENOENT/u);
   assert.equal(storedAuthJson(await readStore(sandbox.storeFile), 'cx-work'), remoteNewer);
 });
 
@@ -288,7 +296,7 @@ test('post-run auto-push refuses unknown legacy remote state instead of overwrit
 
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, /auto-pushed profile 'work'/u);
-  assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), refreshedLocal);
+  await assert.rejects(() => readFile(sandbox.paths.authFile, 'utf8'), /ENOENT/u);
   assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), refreshedLocal);
   assert.equal(storedAuthJson(await readStore(sandbox.storeFile), 'cx-work'), remoteLegacy);
 });
@@ -308,7 +316,7 @@ test('implicit magic sync skips reserved default so local default operations rem
   assert.equal(await readFile(accountPathForName(sandbox.paths, 'default'), 'utf8'), authJson);
 });
 
-test('active auto-pull detects unsaved local refresh instead of overwriting it with remote changes', async (t) => {
+test('stable profile ignores unrelated shared auth while unsafe auto-pull updates only the profile', async (t) => {
   const sandbox = await makeSandbox(t);
   await configureOnePasswordRemote({ vault: 'Dev' }, { paths: sandbox.paths });
   const baseline = authPayload('unsaved-baseline');
@@ -322,10 +330,9 @@ test('active auto-pull detects unsaved local refresh instead of overwriting it w
 
   const result = runCli(['run', '--', 'exec', 'prompt'], sandbox.env);
 
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /sync conflict|diverged/u);
+  assert.equal(result.status, 0, result.stderr);
   assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), localRefresh);
-  assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), localRefresh);
+  assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), remoteRefresh);
   assert.equal(storedAuthJson(await readStore(sandbox.storeFile), 'cx-work'), remoteRefresh);
 });
 
@@ -421,7 +428,8 @@ test('CX_AUTO_SYNC=0 keeps legacy explicit sync behavior available but disables 
   const used = runCli(['use', 'work'], { ...sandbox.env, CX_AUTO_SYNC: '0' });
   assert.equal(used.status, 0, used.stderr);
   assert.doesNotMatch(used.stdout, /auto-pulled/u);
-  assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), baseline);
+  assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), baseline);
+  await assert.rejects(() => readFile(sandbox.paths.authFile, 'utf8'), /ENOENT/u);
 
   const ran = runCli(['run', '--', 'exec'], { ...sandbox.env, CX_AUTO_SYNC: '0', CODEX_FAKE_AUTH_JSON_AFTER_RUN: refreshed });
   assert.equal(ran.status, 0, ran.stderr);

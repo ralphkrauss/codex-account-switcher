@@ -1,20 +1,20 @@
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import {
   access,
   chmod,
-  copyFile,
   mkdir,
-  mkdtemp,
+  open,
   readdir,
   readFile,
   rename,
   rm,
   stat,
-  writeFile,
 } from 'node:fs/promises';
 import { constants as fsConstants, type Stats } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import {
+  basename,
   delimiter,
   dirname,
   isAbsolute,
@@ -27,6 +27,8 @@ export const AUTH_NON_EMPTY_BYTES = 100;
 export const ACCOUNT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/u;
 export const CODEX_TIMEOUT_EXIT_CODE = 124;
 export const CODEX_RATE_LIMIT_EXIT_CODE = 75;
+export const PROFILE_LOCK_FILE = '.cx-profile.lock';
+export const APP_SERVER_CONTROL_SOCKET = join('app-server-control', 'app-server-control.sock');
 
 export interface CodexPaths {
   readonly home: string;
@@ -37,6 +39,7 @@ export interface CodexPaths {
 
 export interface OperationOptions {
   readonly paths?: CodexPaths;
+  /** @deprecated Stable profile homes never write back from shared auth.json. */
   readonly skipWriteback?: boolean;
 }
 
@@ -60,6 +63,7 @@ export interface LoginAccountOptions extends ForceOptions, SpawnCodexOptions {
 export interface AccountEntry {
   readonly name: string;
   readonly file: string;
+  readonly home: string;
   readonly active: boolean;
 }
 
@@ -115,6 +119,16 @@ export interface DoctorReport {
     readonly reason?: string;
   };
   readonly accounts: readonly string[];
+  readonly profiles: readonly {
+    readonly name: string;
+    readonly home: string;
+    readonly authFile: string;
+    readonly authSize: number;
+    readonly configFile: string;
+    readonly fileCredentialStore: boolean;
+    readonly appServerSocket: string;
+    readonly appServerSocketExists: boolean;
+  }[];
   readonly codexExecutable: string | null;
   readonly warnings: readonly string[];
 }
@@ -212,15 +226,28 @@ async function ensureCodexStoreDirs(paths: CodexPaths): Promise<void> {
 }
 
 async function copyFilePrivate(source: string, destination: string): Promise<void> {
-  await ensurePrivateDir(dirname(destination));
-  await copyFile(source, destination);
-  await chmodIfPossible(destination, 0o600);
+  await writeFilePrivate(destination, await readFile(source));
 }
 
-async function writeFilePrivate(destination: string, contents: string): Promise<void> {
+async function writeFilePrivate(destination: string, contents: string | Uint8Array): Promise<void> {
   await ensurePrivateDir(dirname(destination));
-  await writeFile(destination, contents, { mode: 0o600 });
-  await chmodIfPossible(destination, 0o600);
+  const temporary = join(
+    dirname(destination),
+    `.${basename(destination)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`,
+  );
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    handle = await open(temporary, 'wx', 0o600);
+    await handle.writeFile(contents);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await rename(temporary, destination);
+    await chmodIfPossible(destination, 0o600);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
 export function getCodexHome(env: NodeJS.ProcessEnv = process.env): string {
@@ -241,6 +268,18 @@ export function getCodexPaths(env: NodeJS.ProcessEnv = process.env): CodexPaths 
   };
 }
 
+export function accountHomeForName(paths: CodexPaths, name: string): string {
+  const safeName = validateAccountName(name);
+  const accountsRoot = resolve(paths.accountsDir);
+  const accountHome = resolve(accountsRoot, safeName);
+  const relativePath = relative(accountsRoot, accountHome);
+
+  if (relativePath.length === 0 || relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    throw new CxError('invalid account name: resolved outside accounts directory', 2);
+  }
+  return accountHome;
+}
+
 export function validateAccountName(name: string): string {
   if (name.length === 0) {
     throw new CxError('invalid account name: account name must not be empty', 2);
@@ -255,15 +294,93 @@ export function validateAccountName(name: string): string {
 }
 
 export function accountPathForName(paths: CodexPaths, name: string): string {
-  const safeName = validateAccountName(name);
-  const accountsRoot = resolve(paths.accountsDir);
-  const accountFile = resolve(accountsRoot, `${safeName}.json`);
-  const relativePath = relative(accountsRoot, accountFile);
+  return join(accountHomeForName(paths, name), 'auth.json');
+}
 
-  if (relativePath.length === 0 || relativePath.startsWith('..') || isAbsolute(relativePath)) {
-    throw new CxError('invalid account name: resolved outside accounts directory', 2);
+function legacyAccountPathForName(paths: CodexPaths, name: string): string {
+  return join(paths.accountsDir, `${validateAccountName(name)}.json`);
+}
+
+function archivedLegacyAccountPathForName(paths: CodexPaths, name: string): string {
+  return join(paths.accountsDir, '.legacy-v0.3', `${validateAccountName(name)}.json`);
+}
+
+function pinFileCredentialStore(config: string): string {
+  const setting = 'cli_auth_credentials_store = "file"';
+  if (/^\s*cli_auth_credentials_store\s*=/mu.test(config)) {
+    return config.replace(/^\s*cli_auth_credentials_store\s*=.*$/gmu, setting);
   }
+  return `${setting}\n${config}`;
+}
 
+async function ensureProfileConfig(paths: CodexPaths, name: string): Promise<void> {
+  const profileConfig = join(accountHomeForName(paths, name), 'config.toml');
+  if (await pathExists(profileConfig)) {
+    const current = await readFile(profileConfig, 'utf8');
+    const pinned = pinFileCredentialStore(current);
+    if (pinned !== current) {
+      await writeFilePrivate(profileConfig, pinned);
+    }
+    return;
+  }
+  let base = '';
+  try {
+    base = await readFile(join(paths.home, 'config.toml'), 'utf8');
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+  }
+  await writeFilePrivate(profileConfig, pinFileCredentialStore(base));
+}
+
+async function migrateLegacyAccount(paths: CodexPaths, name: string): Promise<boolean> {
+  const destination = accountPathForName(paths, name);
+  if (await pathExists(destination)) {
+    await ensureProfileConfig(paths, name);
+    return false;
+  }
+  const legacy = legacyAccountPathForName(paths, name);
+  if (!(await pathExists(legacy))) {
+    return false;
+  }
+  let source = legacy;
+  const marker = await readCurrentMarker(paths);
+  if (marker.state === 'valid' && marker.name === name && await authLooksNonEmpty(paths)) {
+    try {
+      const [legacyRaw, liveRaw] = await Promise.all([
+        readFile(legacy, 'utf8'),
+        readFile(paths.authFile, 'utf8'),
+      ]);
+      const legacyId = parseAuthJsonForWriteback(legacyRaw).accountId;
+      const liveId = parseAuthJsonForWriteback(liveRaw).accountId;
+      if (legacyId && liveId && legacyId === liveId) {
+        source = paths.authFile;
+      }
+    } catch {
+      // Preserve the known legacy slot when the live file cannot be verified.
+    }
+  }
+  await ensurePrivateDir(accountHomeForName(paths, name));
+  await copyFilePrivate(source, destination);
+  await ensureProfileConfig(paths, name);
+  const preferredArchive = archivedLegacyAccountPathForName(paths, name);
+  await ensurePrivateDir(dirname(preferredArchive));
+  const archive = await pathExists(preferredArchive)
+    ? join(dirname(preferredArchive), `${name}.${Date.now()}.${randomBytes(4).toString('hex')}.json`)
+    : preferredArchive;
+  await rename(legacy, archive);
+  await chmodIfPossible(archive, 0o600);
+  return true;
+}
+
+async function ensureAccountAvailable(paths: CodexPaths, name: string): Promise<string> {
+  const safeName = validateAccountName(name);
+  await migrateLegacyAccount(paths, safeName);
+  const accountFile = accountPathForName(paths, safeName);
+  if (!(await pathExists(accountFile))) {
+    throw new CxError(`no account '${safeName}'`, 1);
+  }
   return accountFile;
 }
 
@@ -319,19 +436,31 @@ export async function listAccountNames(paths: CodexPaths = getCodexPaths()): Pro
     throw error;
   }
 
-  const names: string[] = [];
+  const names = new Set<string>();
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) {
+    if (entry.isDirectory() && !entry.name.startsWith('.')) {
+      try {
+        const candidate = validateAccountName(entry.name);
+        if (await pathExists(accountPathForName(paths, candidate))) {
+          names.add(candidate);
+        }
+      } catch {
+        // Ignore directories that cannot be addressed safely.
+      }
       continue;
     }
-    const candidate = entry.name.slice(0, -'.json'.length);
-    try {
-      names.push(validateAccountName(candidate));
-    } catch {
-      // Ignore legacy or manually-created files that cannot be addressed safely.
+    if (entry.isFile() && entry.name.endsWith('.json')) {
+      const candidate = entry.name.slice(0, -'.json'.length);
+      try {
+        const safeName = validateAccountName(candidate);
+        await migrateLegacyAccount(paths, safeName);
+        names.add(safeName);
+      } catch {
+        // Ignore legacy or manually-created files that cannot be addressed safely.
+      }
     }
   }
-  return names.sort((left, right) => left.localeCompare(right));
+  return [...names].sort((left, right) => left.localeCompare(right));
 }
 
 export async function listAccounts(paths: CodexPaths = getCodexPaths()): Promise<AccountList> {
@@ -346,6 +475,7 @@ export async function listAccounts(paths: CodexPaths = getCodexPaths()): Promise
   const accounts = names.map((name) => ({
     name,
     file: accountPathForName(paths, name),
+    home: accountHomeForName(paths, name),
     active: name === current,
   }));
 
@@ -358,6 +488,7 @@ export async function listAccounts(paths: CodexPaths = getCodexPaths()): Promise
   };
 }
 
+/** @deprecated Stable profile homes do not use shared auth writeback. Retained for legacy migration. */
 export async function writebackCurrentAccount(options: OperationOptions = {}): Promise<WritebackResult> {
   const paths = options.paths ?? getCodexPaths();
   const current = await readCurrentMarker(paths);
@@ -369,39 +500,21 @@ export async function writebackCurrentAccount(options: OperationOptions = {}): P
     return { performed: false, reason: 'current account marker is invalid' };
   }
 
-  const slot = accountPathForName(paths, current.name);
-  if (!(await pathExists(slot))) {
+  const migrated = await migrateLegacyAccount(paths, current.name);
+  if (migrated) {
+    return { performed: true, reason: 'migrated legacy active credentials into the stable profile home', account: current.name };
+  }
+  if (!(await pathExists(accountPathForName(paths, current.name)))) {
     return { performed: false, reason: 'current account slot no longer exists', account: current.name };
   }
-  if (!(await authLooksNonEmpty(paths))) {
-    return { performed: false, reason: 'live auth.json is missing or too small', account: current.name };
-  }
-
-  let liveAuthJson: string;
-  let liveAccountId: string | null;
-  try {
-    liveAuthJson = await readFile(paths.authFile, 'utf8');
-    liveAccountId = parseAuthJsonForWriteback(liveAuthJson).accountId;
-  } catch {
-    return { performed: false, reason: 'live auth.json is not valid JSON', account: current.name };
-  }
-
-  if (liveAccountId) {
-    try {
-      const slotAuthJson = await readFile(slot, 'utf8');
-      const slotAccountId = parseAuthJsonForWriteback(slotAuthJson).accountId;
-      if (slotAccountId && slotAccountId !== liveAccountId) {
-        return { performed: false, reason: 'live auth.json account_id does not match current account slot', account: current.name };
-      }
-    } catch {
-      return { performed: false, reason: 'current account slot is not valid JSON', account: current.name };
-    }
-  }
-
-  await writeFilePrivate(slot, liveAuthJson);
-  return { performed: true, account: current.name };
+  return {
+    performed: false,
+    reason: 'stable profile homes do not write back from shared auth.json',
+    account: current.name,
+  };
 }
 
+/** @deprecated Copying a live OAuth file creates a second writer. Prefer loginAccount. */
 export async function saveAccount(name: string, options: ForceOptions = {}): Promise<void> {
   const paths = options.paths ?? getCodexPaths();
   const safeName = validateAccountName(name);
@@ -410,30 +523,28 @@ export async function saveAccount(name: string, options: ForceOptions = {}): Pro
   if (!(await authLooksNonEmpty(paths))) {
     throw new CxError(`no usable ${paths.authFile} found (run 'codex login' first)`, 1);
   }
-  if ((await pathExists(destination)) && options.force !== true) {
-    throw new CxError(`account '${safeName}' already exists (use --force to overwrite)`, 1);
-  }
-
-  await ensureCodexStoreDirs(paths);
-  await copyFilePrivate(paths.authFile, destination);
-  await writeCurrentMarker(paths, safeName);
+  await withAccountLock(paths, safeName, async () => {
+    if ((await pathExists(destination)) && options.force !== true) {
+      throw new CxError(`account '${safeName}' already exists (use --force to overwrite)`, 1);
+    }
+    await ensureCodexStoreDirs(paths);
+    await copyFilePrivate(paths.authFile, destination);
+    await ensureProfileConfig(paths, safeName);
+    await writeCurrentMarker(paths, safeName);
+  });
 }
 
 export async function useAccount(name: string, options: OperationOptions = {}): Promise<WritebackResult> {
   const paths = options.paths ?? getCodexPaths();
   const safeName = validateAccountName(name);
-  const source = accountPathForName(paths, safeName);
-
-  if (!(await pathExists(source))) {
-    throw new CxError(`no account '${safeName}'`, 1);
-  }
-
-  const writeback = options.skipWriteback === true
-    ? { performed: false, reason: 'writeback skipped by caller' }
-    : await writebackCurrentAccount({ paths });
-  await copyFilePrivate(source, paths.authFile);
+  await ensureAccountAvailable(paths, safeName);
+  await ensureProfileConfig(paths, safeName);
   await writeCurrentMarker(paths, safeName);
-  return writeback;
+  return {
+    performed: false,
+    reason: 'selected stable profile without changing shared auth.json',
+    account: safeName,
+  };
 }
 
 export async function renameAccount(
@@ -449,23 +560,35 @@ export async function renameAccount(
     throw new CxError('old and new account names must differ', 2);
   }
 
-  const source = accountPathForName(paths, safeOldName);
-  const destination = accountPathForName(paths, safeNewName);
-  const destinationExists = await pathExists(destination);
-
-  if (!(await pathExists(source))) {
-    throw new CxError(`no account '${safeOldName}'`, 1);
-  }
+  await ensureAccountAvailable(paths, safeOldName);
+  const source = accountHomeForName(paths, safeOldName);
+  const destination = accountHomeForName(paths, safeNewName);
+  const destinationExists = await pathExists(accountPathForName(paths, safeNewName));
   if (destinationExists && options.force !== true) {
     throw new CxError(`account '${safeNewName}' already exists (use --force to overwrite)`, 1);
   }
 
-  await ensurePrivateDir(paths.accountsDir);
-  if (destinationExists) {
-    await rm(destination, { force: true });
+  const releaseSource = await acquireProfileLock(source, safeOldName);
+  let releaseDestination: (() => Promise<void>) | null = null;
+  let completed = false;
+  try {
+    if (destinationExists) {
+      releaseDestination = await acquireProfileLock(destination, safeNewName);
+    }
+    await ensurePrivateDir(paths.accountsDir);
+    if (destinationExists) {
+      await rm(destination, { recursive: true, force: true });
+    }
+    await rename(source, destination);
+    await rm(join(destination, PROFILE_LOCK_FILE), { force: true });
+    await chmodIfPossible(destination, 0o700);
+    completed = true;
+  } finally {
+    if (!completed) {
+      await releaseDestination?.().catch(() => undefined);
+      await releaseSource().catch(() => undefined);
+    }
   }
-  await rename(source, destination);
-  await chmodIfPossible(destination, 0o600);
 
   const marker = await readCurrentMarker(paths);
   const currentUpdated = marker.state === 'valid' && marker.name === safeOldName;
@@ -484,16 +607,22 @@ export async function renameAccount(
 export async function removeAccount(name: string, options: OperationOptions = {}): Promise<RemoveResult> {
   const paths = options.paths ?? getCodexPaths();
   const safeName = validateAccountName(name);
-  const accountFile = accountPathForName(paths, safeName);
-
-  if (!(await pathExists(accountFile))) {
-    throw new CxError(`no account '${safeName}'`, 1);
-  }
+  await ensureAccountAvailable(paths, safeName);
+  const accountHome = accountHomeForName(paths, safeName);
 
   const marker = await readCurrentMarker(paths);
   const wasActive = marker.state === 'valid' && marker.name === safeName;
 
-  await rm(accountFile, { force: false });
+  const releaseLock = await acquireProfileLock(accountHome, safeName);
+  let removed = false;
+  try {
+    await rm(accountHome, { recursive: true, force: false });
+    removed = true;
+  } finally {
+    if (!removed) {
+      await releaseLock().catch(() => undefined);
+    }
+  }
   if (wasActive) {
     await clearCurrentMarker(paths);
   }
@@ -663,34 +792,97 @@ export interface IsolatedRunResult {
   readonly authUpdated: boolean;
 }
 
-async function copyOptionalFilePrivate(source: string, destination: string): Promise<void> {
-  if (await pathExists(source)) {
-    await copyFilePrivate(source, destination);
+interface ProfileLockPayload {
+  readonly pid: number;
+  readonly nonce: string;
+  readonly acquiredAt: string;
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? (error as NodeJS.ErrnoException).code
+      : undefined;
+    return code === 'EPERM';
   }
 }
 
-async function copyIsolatedAuthBack(accountFile: string, isolatedPaths: CodexPaths): Promise<boolean> {
-  if (!(await authLooksNonEmpty(isolatedPaths))) {
-    return false;
-  }
-  const original = await readFile(accountFile, 'utf8');
-  const updated = await readFile(isolatedPaths.authFile, 'utf8');
-  let originalAccountId: string | null = null;
-  const updatedAccountId = parseAuthJsonForWriteback(updated).accountId;
+async function readProfileLock(lockFile: string): Promise<ProfileLockPayload | null> {
   try {
-    originalAccountId = parseAuthJsonForWriteback(original).accountId;
+    const parsed = JSON.parse(await readFile(lockFile, 'utf8')) as Partial<ProfileLockPayload>;
+    if (typeof parsed.pid === 'number'
+      && typeof parsed.nonce === 'string'
+      && typeof parsed.acquiredAt === 'string') {
+      return { pid: parsed.pid, nonce: parsed.nonce, acquiredAt: parsed.acquiredAt };
+    }
   } catch {
-    // Older saved fixtures/formats may not be parseable for account_id checks;
-    // still require the isolated child auth to be valid JSON before writeback.
+    // An unreadable lock is treated as stale and removed by the acquirer.
   }
-  if (originalAccountId && updatedAccountId && originalAccountId !== updatedAccountId) {
-    throw new CxError('isolated codex run produced auth.json for a different account_id; refusing to update account slot', 1);
+  return null;
+}
+
+async function acquireProfileLock(profileHome: string, account: string): Promise<() => Promise<void>> {
+  await ensurePrivateDir(profileHome);
+  const lockFile = join(profileHome, PROFILE_LOCK_FILE);
+  const payload: ProfileLockPayload = {
+    pid: process.pid,
+    nonce: randomBytes(12).toString('hex'),
+    acquiredAt: new Date().toISOString(),
+  };
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open(lockFile, 'wx', 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify(payload)}\n`);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      return async () => {
+        const current = await readProfileLock(lockFile);
+        if (current?.nonce === payload.nonce) {
+          await rm(lockFile, { force: true });
+        }
+      };
+    } catch (error) {
+      const code = typeof error === 'object' && error !== null && 'code' in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+      if (code !== 'EEXIST') {
+        throw error;
+      }
+      const existing = await readProfileLock(lockFile);
+      if (existing && processIsAlive(existing.pid)) {
+        throw new CxError(
+          `account '${account}' is already in use by cx process ${existing.pid} since ${existing.acquiredAt}; use a separately logged-in worker profile for concurrent runs`,
+          1,
+        );
+      }
+      await rm(lockFile, { force: true });
+    }
   }
-  if (updated === original) {
-    return false;
+  throw new CxError(`could not acquire the profile lock for account '${account}'`, 1);
+}
+
+export async function withAccountLock<T>(
+  paths: CodexPaths,
+  account: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const safeAccount = validateAccountName(account);
+  const releaseLock = await acquireProfileLock(accountHomeForName(paths, safeAccount), safeAccount);
+  try {
+    return await operation();
+  } finally {
+    await releaseLock();
   }
-  await writeFilePrivate(accountFile, updated);
-  return true;
 }
 
 export async function runCodexWithIsolatedAccount(
@@ -702,31 +894,24 @@ export async function runCodexWithIsolatedAccount(
   const { paths: _ignoredPaths, skipWriteback: _ignoredSkipWriteback, ...spawnOptions } = options;
   const paths = options.paths ?? getCodexPaths(env);
   const safeName = validateAccountName(name);
-  const accountFile = accountPathForName(paths, safeName);
-  if (!(await pathExists(accountFile))) {
-    throw new CxError(`no account '${safeName}'`, 1);
-  }
-
-  const current = await readCurrentMarker(paths);
-  if (current.state === 'valid' && current.name === safeName && options.skipWriteback !== true) {
-    await writebackCurrentAccount({ paths });
-  }
-
-  const isolatedHome = await mkdtemp(join(tmpdir(), `cx-run-${safeName}-`));
-  const isolatedEnv = { ...env, CODEX_HOME: isolatedHome };
-  const isolatedPaths = getCodexPaths(isolatedEnv);
+  const accountFile = await ensureAccountAvailable(paths, safeName);
+  const profileHome = accountHomeForName(paths, safeName);
+  const releaseLock = await acquireProfileLock(profileHome, safeName);
   try {
-    await ensurePrivateDir(isolatedHome);
-    await copyFilePrivate(accountFile, isolatedPaths.authFile);
-    await copyOptionalFilePrivate(join(paths.home, 'config.toml'), join(isolatedHome, 'config.toml'));
+    await ensureProfileConfig(paths, safeName);
+    const before = await readFile(accountFile, 'utf8');
+    parseAuthJsonForWriteback(before);
+    const profileEnv = { ...env, CODEX_HOME: profileHome };
     const exitCode = await runCodex(codexArgs, {
       ...spawnOptions,
-      env: isolatedEnv,
+      env: profileEnv,
     });
-    const authUpdated = await copyIsolatedAuthBack(accountFile, isolatedPaths);
+    const after = await readFile(accountFile, 'utf8');
+    parseAuthJsonForWriteback(after);
+    const authUpdated = after !== before;
     return { exitCode, account: safeName, authUpdated };
   } finally {
-    await rm(isolatedHome, { recursive: true, force: true });
+    await releaseLock();
   }
 }
 
@@ -735,30 +920,53 @@ export async function loginAccount(
   options: LoginAccountOptions = {},
 ): Promise<WritebackResult> {
   const paths = options.paths ?? getCodexPaths(options.env ?? process.env);
+  const env = options.env ?? process.env;
   const safeName = validateAccountName(name);
   const destination = accountPathForName(paths, safeName);
+  const legacy = legacyAccountPathForName(paths, safeName);
 
-  if ((await pathExists(destination)) && options.force !== true) {
+  if (((await pathExists(destination)) || (await pathExists(legacy))) && options.force !== true) {
     throw new CxError(`account '${safeName}' already exists (use --force to overwrite)`, 1);
   }
 
-  const writeback = await writebackCurrentAccount({ paths });
-  const loginExitCode = await runCodex([], {
-    ...options,
-    args: ['login', ...(options.loginArgs ?? [])],
-  });
-
-  if (loginExitCode !== 0) {
-    throw new CxError(`codex login exited with code ${loginExitCode}`, loginExitCode);
+  if (await pathExists(legacy)) {
+    await migrateLegacyAccount(paths, safeName);
   }
-  if (!(await authLooksNonEmpty(paths))) {
-    throw new CxError(`codex login did not leave a usable ${paths.authFile}`, 1);
+  await ensurePrivateDir(accountHomeForName(paths, safeName));
+  await ensureProfileConfig(paths, safeName);
+  const appServerSocket = join(accountHomeForName(paths, safeName), APP_SERVER_CONTROL_SOCKET);
+  if (await pathExists(appServerSocket)) {
+    throw new CxError(
+      `profile '${safeName}' has an app-server control socket at ${appServerSocket}; stop the Codex app-server using this profile before logging in, then remove the stale socket only after its process has stopped`,
+      1,
+    );
   }
+  const releaseLock = await acquireProfileLock(accountHomeForName(paths, safeName), safeName);
+  try {
+    const { paths: _ignoredPaths, skipWriteback: _ignoredSkipWriteback, ...spawnOptions } = options;
+    const loginExitCode = await runCodex([], {
+      ...spawnOptions,
+      env: { ...env, CODEX_HOME: accountHomeForName(paths, safeName) },
+      args: ['login', ...(options.loginArgs ?? [])],
+    });
 
-  await ensureCodexStoreDirs(paths);
-  await copyFilePrivate(paths.authFile, destination);
-  await writeCurrentMarker(paths, safeName);
-  return writeback;
+    if (loginExitCode !== 0) {
+      throw new CxError(`codex login exited with code ${loginExitCode}`, loginExitCode);
+    }
+    const stats = await statIfExists(destination);
+    if (!stats?.isFile() || stats.size <= AUTH_NON_EMPTY_BYTES) {
+      throw new CxError(`codex login did not leave a usable ${destination}`, 1);
+    }
+    parseAuthJsonForWriteback(await readFile(destination, 'utf8'));
+    await writeCurrentMarker(paths, safeName);
+    return {
+      performed: false,
+      reason: 'logged in directly to the stable profile home',
+      account: safeName,
+    };
+  } finally {
+    await releaseLock();
+  }
 }
 
 export async function switchAndRunCodex(
@@ -768,7 +976,7 @@ export async function switchAndRunCodex(
 ): Promise<number> {
   const paths = options.paths ?? getCodexPaths(options.env ?? process.env);
   await useAccount(name, { paths });
-  return await runCodex(codexArgs, options);
+  return (await runCodexWithIsolatedAccount(name, codexArgs, options)).exitCode;
 }
 
 async function executableAccess(path: string): Promise<boolean> {
@@ -819,14 +1027,43 @@ export async function inspectDoctor(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<DoctorReport> {
   const paths = getCodexPaths(env);
-  const [homeStats, accountsDirStats, authStats, marker, accountNames, codexExecutable] = await Promise.all([
+  // Legacy account discovery can migrate files, so observe directory state after it completes.
+  const accountNames = await listAccountNames(paths);
+  const [homeStats, accountsDirStats, authStats, marker, codexExecutable, remoteConfigStats] = await Promise.all([
     statIfExists(paths.home),
     statIfExists(paths.accountsDir),
     statIfExists(paths.authFile),
     readCurrentMarker(paths),
-    listAccountNames(paths),
     resolveExecutable('codex', env),
+    statIfExists(join(paths.home, 'remote.json')),
   ]);
+
+  const profiles = await Promise.all(accountNames.map(async (name) => {
+    const home = accountHomeForName(paths, name);
+    const authFile = accountPathForName(paths, name);
+    const configFile = join(home, 'config.toml');
+    const appServerSocket = join(home, APP_SERVER_CONTROL_SOCKET);
+    const [profileAuthStats, configText, appServerSocketStats] = await Promise.all([
+      statIfExists(authFile),
+      readFile(configFile, 'utf8').catch((error: unknown) => {
+        if (isNotFoundError(error)) {
+          return '';
+        }
+        throw error;
+      }),
+      statIfExists(appServerSocket),
+    ]);
+    return {
+      name,
+      home,
+      authFile,
+      authSize: profileAuthStats?.isFile() ? profileAuthStats.size : 0,
+      configFile,
+      fileCredentialStore: /^\s*cli_auth_credentials_store\s*=\s*["']file["']\s*$/mu.test(configText),
+      appServerSocket,
+      appServerSocketExists: appServerSocketStats !== null,
+    };
+  }));
 
   let slotExists = false;
   let currentName: string | null = null;
@@ -843,10 +1080,28 @@ export async function inspectDoctor(
 
   const authSize = authStats?.isFile() ? authStats.size : 0;
   const warnings: string[] = [];
-  if (!authStats?.isFile()) {
-    warnings.push('auth.json is missing; run codex login or cx use <name> before launching Codex.');
+  if (!authStats?.isFile() && accountNames.length === 0) {
+    warnings.push('no named profiles or shared auth.json exist; run cx login <name> --device-auth.');
   } else if (authSize <= AUTH_NON_EMPTY_BYTES) {
-    warnings.push('auth.json exists but is too small to be treated as a usable login for save/writeback.');
+    if (authStats?.isFile()) {
+      warnings.push('shared auth.json exists but is too small to be treated as a usable legacy login.');
+    }
+  } else {
+    warnings.push('shared root auth.json is a legacy fallback; named profiles do not read or update it.');
+  }
+  for (const profile of profiles) {
+    if (profile.authSize <= AUTH_NON_EMPTY_BYTES) {
+      warnings.push(`profile '${profile.name}' auth.json is too small to be a usable login.`);
+    }
+    if (!profile.fileCredentialStore) {
+      warnings.push(`profile '${profile.name}' is not pinned to cli_auth_credentials_store = "file"; launching it through cx will repair this.`);
+    }
+    if (profile.appServerSocketExists) {
+      warnings.push(`profile '${profile.name}' has a Codex app-server control socket; if /status shows the wrong account, stop that profile's app-server before logging in again.`);
+    }
+  }
+  if (remoteConfigStats?.isFile()) {
+    warnings.push('legacy remote credential sync is configured but push, pull, and automatic sync are disabled by default.');
   }
   if (marker.state === 'invalid') {
     warnings.push('current account marker is invalid; writeback will be skipped until it is fixed.');
@@ -879,6 +1134,7 @@ export async function inspectDoctor(
       ...(currentReason ? { reason: currentReason } : {}),
     },
     accounts: accountNames,
+    profiles,
     codexExecutable,
     warnings,
   };

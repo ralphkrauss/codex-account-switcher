@@ -1,7 +1,9 @@
 export {
   ACCOUNT_NAME_PATTERN,
+  APP_SERVER_CONTROL_SOCKET,
   AUTH_NON_EMPTY_BYTES,
   CxError,
+  accountHomeForName,
   accountPathForName,
   authFileExists,
   authLooksNonEmpty,
@@ -21,14 +23,19 @@ export {
   switchAndRunCodex,
   useAccount,
   validateAccountName,
+  withAccountLock,
   writebackCurrentAccount,
 } from './accounts.js';
 
 export {
   HERMES_CODEX_BASE_URL,
   HERMES_OPENAI_CODEX_PROVIDER,
+  UNSAFE_HERMES_TOKEN_SHARE_ENV,
   getHermesPaths,
+  hermesProfileForAccount,
   inspectHermesStatus,
+  loginHermesAccount,
+  runHermesAccount,
   syncHermesAccount,
   useHermesAccount,
 } from './hermes.js';
@@ -40,6 +47,7 @@ export {
   ONEPASSWORD_BACKEND,
   REMOTE_CONFIG_VERSION,
   REMOTE_METADATA_FIELD,
+  UNSAFE_LEGACY_AUTH_SYNC_ENV,
   autoPullAccountForUse,
   autoPushAccountIfChanged,
   configureOnePasswordRemote,
@@ -80,7 +88,10 @@ export type {
 
 export type {
   HermesPaths,
+  HermesLoginResult,
+  HermesNativeOptions,
   HermesProfileOptions,
+  HermesStatusOptions,
   HermesStatus,
   HermesSyncResult,
   HermesUseOptions,

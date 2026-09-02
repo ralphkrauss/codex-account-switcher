@@ -14,13 +14,18 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import {
   CxError,
+  accountHomeForName,
   accountPathForName,
   getCodexPaths,
+  listAccountNames,
+  runCodex,
   validateAccountName,
+  withAccountLock,
 } from './accounts.js';
 
 export const HERMES_OPENAI_CODEX_PROVIDER = 'openai-codex';
 export const HERMES_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
+export const UNSAFE_HERMES_TOKEN_SHARE_ENV = 'CX_ALLOW_UNSAFE_HERMES_TOKEN_SHARE';
 
 const AUTH_STORE_VERSION = 1;
 const ERROR_MARKER_KEYS = [
@@ -56,6 +61,26 @@ export interface HermesUseOptions extends HermesProfileOptions {
   readonly updateConfig?: boolean;
 }
 
+export interface HermesStatusOptions extends HermesProfileOptions {
+  readonly account?: string | null;
+}
+
+export interface HermesNativeOptions extends HermesProfileOptions {
+  readonly command?: string;
+  readonly args?: readonly string[];
+  readonly cwd?: string;
+  readonly stdin?: 'inherit' | 'ignore';
+  readonly timeoutSeconds?: number;
+}
+
+export interface HermesLoginResult {
+  readonly account: string;
+  readonly profile: string;
+  readonly hermesHome: string;
+  readonly authFile: string;
+  readonly configFile: string;
+}
+
 export interface HermesUseResult {
   readonly account: string;
   readonly codexAccountFile: string;
@@ -85,6 +110,8 @@ export interface HermesStatus {
   readonly hasTokens: boolean;
   readonly hasAccessToken: boolean;
   readonly hasRefreshToken: boolean;
+  readonly accessTokenExpiresAt: string | null;
+  readonly accessTokenExpired: boolean | null;
   readonly lastRefresh: string | null;
   readonly authMode: string | null;
   readonly linkedAccount: string | null;
@@ -239,6 +266,10 @@ function validateHermesProfileName(name: string): string {
   }
 }
 
+export function hermesProfileForAccount(account: string): string {
+  return validateHermesProfileName(`cx-${validateAccountName(account)}`);
+}
+
 export function getHermesPaths(options: HermesProfileOptions = {}): HermesPaths {
   const env = options.env ?? process.env;
   const rawProfile = options.profile;
@@ -299,6 +330,7 @@ async function readCodexAccountPayload(
 ): Promise<{ account: string; accountFile: string; payload: JsonObject }> {
   const safeAccount = validateAccountName(account);
   const codexPaths = getCodexPaths(env);
+  await listAccountNames(codexPaths);
   const accountFile = accountPathForName(codexPaths, safeAccount);
   if (!(await pathExists(accountFile))) {
     throw new CxError(`no account '${safeAccount}'`, 1);
@@ -309,6 +341,165 @@ async function readCodexAccountPayload(
     accountFile,
     payload: await readJsonObject(accountFile, `Codex account '${safeAccount}'`),
   };
+}
+
+function requireUnsafeHermesTokenShare(env: NodeJS.ProcessEnv): void {
+  if (env[UNSAFE_HERMES_TOKEN_SHARE_ENV] !== '1') {
+    throw new CxError(
+      `copying rotating OAuth credentials between Codex and Hermes is disabled; use 'cx hermes login <account>' to create an independent Hermes session. For one-time recovery only, set ${UNSAFE_HERMES_TOKEN_SHARE_ENV}=1 and ensure Codex is not using the credential`,
+      1,
+    );
+  }
+}
+
+function jwtAccountId(accessToken: string): string | null {
+  try {
+    const encoded = accessToken.split('.')[1];
+    if (!encoded) {
+      return null;
+    }
+    const claims = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as JsonObject;
+    const direct = stringValue(claims.account_id) || stringValue(claims.chatgpt_account_id);
+    if (direct) {
+      return direct;
+    }
+    const openaiAuth = claims['https://api.openai.com/auth'];
+    if (isRecord(openaiAuth)) {
+      return stringValue(openaiAuth.chatgpt_account_id) || stringValue(openaiAuth.account_id) || null;
+    }
+    return stringValue(claims['https://api.openai.com/auth.chatgpt_account_id']) || null;
+  } catch {
+    return null;
+  }
+}
+
+function accessTokenExpiration(tokens: JsonObject | null): number | null {
+  if (!tokens) {
+    return null;
+  }
+  const expiresAtMs = numericValue(tokens.expires_at_ms);
+  if (expiresAtMs !== null) {
+    return expiresAtMs;
+  }
+  const expiresAt = tokens.expires_at;
+  if (typeof expiresAt === 'number' && Number.isFinite(expiresAt)) {
+    return expiresAt > 10_000_000_000 ? expiresAt : expiresAt * 1000;
+  }
+  if (typeof expiresAt === 'string' && expiresAt.trim()) {
+    const numeric = Number(expiresAt);
+    if (Number.isFinite(numeric)) {
+      return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+    }
+    const parsedDate = Date.parse(expiresAt);
+    if (Number.isFinite(parsedDate)) {
+      return parsedDate;
+    }
+  }
+  const accessToken = stringValue(tokens.access_token);
+  try {
+    const encoded = accessToken.split('.')[1];
+    if (!encoded) {
+      return null;
+    }
+    const claims = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as JsonObject;
+    const exp = numericValue(claims.exp);
+    return exp === null ? null : exp * 1000;
+  } catch {
+    return null;
+  }
+}
+
+function codexAccountId(payload: JsonObject): string | null {
+  const tokens = isRecord(payload.tokens) ? payload.tokens : null;
+  return tokens ? stringValue(tokens.account_id) : null;
+}
+
+export async function loginHermesAccount(
+  account: string,
+  options: HermesNativeOptions = {},
+): Promise<HermesLoginResult> {
+  const env = options.env ?? process.env;
+  const accountData = await readCodexAccountPayload(account, env);
+  const codexTokens = accountTokensFromPayload(accountData.payload, accountData.account);
+  const profile = options.profile
+    ? validateHermesProfileName(options.profile)
+    : hermesProfileForAccount(accountData.account);
+  const command = options.command ?? env.CX_HERMES_BIN ?? 'hermes';
+  const hermesPaths = getHermesPaths({ env, profile });
+  const beforeStore = await readHermesAuthStore(hermesPaths.authFile);
+  const beforeIds = new Set(openaiCodexPoolEntries(beforeStore).map((entry) => stringValue(entry.id)).filter(Boolean));
+  const beforeProviderAccess = stringValue(tokensFromProviderState(providerStateFromStore(beforeStore))?.access_token);
+  const exitCode = await runCodex([], {
+    command,
+    args: ['--profile', profile, 'auth', 'add', HERMES_OPENAI_CODEX_PROVIDER, '--label', `cx:${accountData.account}`],
+    env,
+    cwd: options.cwd,
+    stdin: options.stdin ?? 'inherit',
+    timeoutSeconds: options.timeoutSeconds,
+  });
+  if (exitCode !== 0) {
+    throw new CxError(`Hermes login exited with code ${exitCode}`, exitCode);
+  }
+  const store = await readHermesAuthStore(hermesPaths.authFile);
+  const newPoolCredentials = openaiCodexPoolEntries(store)
+    .filter((entry) => !beforeIds.has(stringValue(entry.id)))
+    .map(tokensFromPoolEntry)
+    .filter((tokens): tokens is JsonObject => tokens !== null);
+  const providerTokens = tokensFromProviderState(providerStateFromStore(store));
+  const providerAccess = stringValue(providerTokens?.access_token);
+  const selectedTokens = newPoolCredentials.length === 1
+    ? newPoolCredentials[0] ?? null
+    : providerTokens && providerAccess && providerAccess !== beforeProviderAccess ? providerTokens : null;
+  const accessToken = selectedTokens ? stringValue(selectedTokens.access_token) : '';
+  const refreshToken = selectedTokens ? stringValue(selectedTokens.refresh_token) : '';
+  if (!accessToken || !refreshToken) {
+    throw new CxError(`Hermes login did not create usable ${HERMES_OPENAI_CODEX_PROVIDER} credentials in profile '${profile}'`, 1);
+  }
+  const expectedAccountId = stringValue(codexTokens.account_id) || codexAccountId(accountData.payload);
+  const actualAccountId = jwtAccountId(accessToken);
+  if (expectedAccountId && actualAccountId && expectedAccountId !== actualAccountId) {
+    throw new CxError(
+      `Hermes profile '${profile}' was authenticated to a different ChatGPT account/workspace than cx account '${accountData.account}'; remove that Hermes credential and retry with the matching account`,
+      1,
+    );
+  }
+  await updateHermesConfigProvider(hermesPaths.configFile);
+  return {
+    account: accountData.account,
+    profile,
+    hermesHome: hermesPaths.home,
+    authFile: hermesPaths.authFile,
+    configFile: hermesPaths.configFile,
+  };
+}
+
+export async function runHermesAccount(
+  account: string,
+  hermesArgs: readonly string[] = [],
+  options: HermesNativeOptions = {},
+): Promise<number> {
+  const env = options.env ?? process.env;
+  const accountData = await readCodexAccountPayload(account, env);
+  const profile = options.profile
+    ? validateHermesProfileName(options.profile)
+    : hermesProfileForAccount(accountData.account);
+  const status = await inspectHermesStatus({ env, profile, account: accountData.account });
+  if (!status.hasAccessToken || !status.hasRefreshToken) {
+    throw new CxError(
+      `Hermes profile '${profile}' has no usable Codex login; run 'cx hermes login ${accountData.account}${options.profile ? ` --profile ${profile}` : ''}' first`,
+      1,
+    );
+  }
+  const codexPaths = getCodexPaths(env);
+  const codexHome = accountHomeForName(codexPaths, accountData.account);
+  return await withAccountLock(codexPaths, accountData.account, async () => await runCodex([], {
+    command: options.command ?? env.CX_HERMES_BIN ?? 'hermes',
+    args: ['--profile', profile, ...(options.args ?? hermesArgs)],
+    env: { ...env, CODEX_HOME: codexHome },
+    cwd: options.cwd,
+    stdin: options.stdin,
+    timeoutSeconds: options.timeoutSeconds,
+  }));
 }
 
 function isoNow(): string {
@@ -657,66 +848,107 @@ function linkedAccountsFromPool(entries: readonly JsonObject[]): string[] {
   return accounts;
 }
 
-export async function useHermesAccount(account: string, options: HermesUseOptions = {}): Promise<HermesUseResult> {
-  const env = options.env ?? process.env;
-  const accountData = await readCodexAccountPayload(account, env);
-  const tokens = accountTokensFromPayload(accountData.payload, accountData.account);
-  const hermesPaths = getHermesPaths(options);
-  const lastRefresh = isoNow();
-
-  const store = await readHermesAuthStore(hermesPaths.authFile);
-  store.version = AUTH_STORE_VERSION;
-  store.updated_at = lastRefresh;
-
-  const providers = ensureObjectProperty(store, 'providers');
-  const currentState = isRecord(providers[HERMES_OPENAI_CODEX_PROVIDER])
-    ? { ...(providers[HERMES_OPENAI_CODEX_PROVIDER] as JsonObject) }
-    : {};
-  providers[HERMES_OPENAI_CODEX_PROVIDER] = {
-    ...currentState,
-    tokens,
-    last_refresh: lastRefresh,
-    auth_mode: 'chatgpt',
-  };
-  store.active_provider = HERMES_OPENAI_CODEX_PROVIDER;
-
-  const pool = ensureObjectProperty(store, 'credential_pool');
-  const currentEntries = Array.isArray(pool[HERMES_OPENAI_CODEX_PROVIDER])
-    ? pool[HERMES_OPENAI_CODEX_PROVIDER]
-    : [];
-  pool[HERMES_OPENAI_CODEX_PROVIDER] = upsertCxPoolEntry(
-    currentEntries,
-    accountData.account,
-    tokens,
-    lastRefresh,
-  );
-
-  await writeJsonPrivate(hermesPaths.authFile, store);
-  let hermesConfigFile: string | null = null;
-  if (options.updateConfig !== false) {
-    await updateHermesConfigProvider(hermesPaths.configFile);
-    hermesConfigFile = hermesPaths.configFile;
+function tokensFromPoolEntry(entry: JsonObject): JsonObject | null {
+  const accessToken = stringValue(entry.access_token);
+  const refreshToken = stringValue(entry.refresh_token);
+  if (!accessToken || !refreshToken) {
+    return null;
   }
-
-  return {
-    account: accountData.account,
-    codexAccountFile: accountData.accountFile,
-    hermesHome: hermesPaths.home,
-    hermesAuthFile: hermesPaths.authFile,
-    hermesConfigFile,
-    profile: hermesPaths.profile,
+  const tokens: JsonObject = {
+    access_token: accessToken,
+    refresh_token: refreshToken,
   };
+  for (const key of POOL_TOKEN_EXTRA_KEYS) {
+    if (entry[key] !== undefined && entry[key] !== null) {
+      tokens[key] = entry[key];
+    }
+  }
+  return tokens;
 }
 
+/** @deprecated Copying Codex OAuth tokens into Hermes creates competing refresh writers. */
+export async function useHermesAccount(account: string, options: HermesUseOptions = {}): Promise<HermesUseResult> {
+  const env = options.env ?? process.env;
+  requireUnsafeHermesTokenShare(env);
+  const safeAccount = validateAccountName(account);
+  const codexPaths = getCodexPaths(env);
+  return await withAccountLock(codexPaths, safeAccount, async () => {
+    const accountData = await readCodexAccountPayload(safeAccount, env);
+    const tokens = accountTokensFromPayload(accountData.payload, accountData.account);
+    const hermesPaths = getHermesPaths(options);
+    const lastRefresh = isoNow();
+
+    const store = await readHermesAuthStore(hermesPaths.authFile);
+    store.version = AUTH_STORE_VERSION;
+    store.updated_at = lastRefresh;
+
+    const providers = ensureObjectProperty(store, 'providers');
+    const currentState = isRecord(providers[HERMES_OPENAI_CODEX_PROVIDER])
+      ? { ...(providers[HERMES_OPENAI_CODEX_PROVIDER] as JsonObject) }
+      : {};
+    providers[HERMES_OPENAI_CODEX_PROVIDER] = {
+      ...currentState,
+      tokens,
+      last_refresh: lastRefresh,
+      auth_mode: 'chatgpt',
+    };
+    store.active_provider = HERMES_OPENAI_CODEX_PROVIDER;
+
+    const pool = ensureObjectProperty(store, 'credential_pool');
+    const currentEntries = Array.isArray(pool[HERMES_OPENAI_CODEX_PROVIDER])
+      ? pool[HERMES_OPENAI_CODEX_PROVIDER]
+      : [];
+    pool[HERMES_OPENAI_CODEX_PROVIDER] = upsertCxPoolEntry(
+      currentEntries,
+      accountData.account,
+      tokens,
+      lastRefresh,
+    );
+
+    await writeJsonPrivate(hermesPaths.authFile, store);
+    let hermesConfigFile: string | null = null;
+    if (options.updateConfig !== false) {
+      await updateHermesConfigProvider(hermesPaths.configFile);
+      hermesConfigFile = hermesPaths.configFile;
+    }
+
+    return {
+      account: accountData.account,
+      codexAccountFile: accountData.accountFile,
+      hermesHome: hermesPaths.home,
+      hermesAuthFile: hermesPaths.authFile,
+      hermesConfigFile,
+      profile: hermesPaths.profile,
+    };
+  });
+}
+
+/** @deprecated Copying Hermes OAuth tokens into Codex creates competing refresh writers. */
 export async function syncHermesAccount(account: string, options: HermesProfileOptions = {}): Promise<HermesSyncResult> {
   const env = options.env ?? process.env;
+  requireUnsafeHermesTokenShare(env);
   const accountData = await readCodexAccountPayload(account, env);
   const hermesPaths = getHermesPaths(options);
   const store = await readHermesAuthStore(hermesPaths.authFile);
   const providerState = providerStateFromStore(store);
-  const tokens = tokensFromProviderState(providerState);
+  const providerTokens = tokensFromProviderState(providerState);
+  const poolEntries = openaiCodexPoolEntries(store);
+  const linkedAccounts = linkedAccountsFromPool(poolEntries);
+  const matchingEntries = poolEntries.filter((entry) => accountFromCxPoolEntry(entry) === accountData.account);
+  let tokens: JsonObject | null = null;
+  if (linkedAccounts.length === 1 && linkedAccounts[0] === accountData.account) {
+    tokens = providerTokens;
+  } else if (matchingEntries.length === 1) {
+    tokens = tokensFromPoolEntry(matchingEntries[0] ?? {});
+  } else if (linkedAccounts.length === 0 && providerTokens) {
+    const expectedId = codexAccountId(accountData.payload);
+    const actualId = jwtAccountId(stringValue(providerTokens.access_token));
+    if (expectedId && actualId && expectedId === actualId) {
+      tokens = providerTokens;
+    }
+  }
   if (!tokens) {
-    throw new CxError(`Hermes ${HERMES_OPENAI_CODEX_PROVIDER} tokens not found at ${hermesPaths.authFile}`, 1);
+    throw new CxError(`Hermes ${HERMES_OPENAI_CODEX_PROVIDER} credential ownership is missing or ambiguous for cx account '${accountData.account}'; use 'cx hermes login ${accountData.account}' instead of copying tokens`, 1);
   }
 
   const accessToken = stringValue(tokens.access_token);
@@ -728,13 +960,17 @@ export async function syncHermesAccount(account: string, options: HermesProfileO
     throw new CxError(`Hermes ${HERMES_OPENAI_CODEX_PROVIDER} tokens are missing refresh_token`, 1);
   }
 
-  await writeJsonPrivate(accountData.accountFile, {
-    ...accountData.payload,
-    tokens: {
-      ...tokens,
-      access_token: accessToken,
-      refresh_token: refreshToken,
-    },
+  const codexPaths = getCodexPaths(env);
+  await withAccountLock(codexPaths, accountData.account, async () => {
+    const current = await readJsonObject(accountData.accountFile, `Codex account '${accountData.account}'`);
+    await writeJsonPrivate(accountData.accountFile, {
+      ...current,
+      tokens: {
+        ...tokens,
+        access_token: accessToken,
+        refresh_token: refreshToken,
+      },
+    });
   });
 
   return {
@@ -746,7 +982,7 @@ export async function syncHermesAccount(account: string, options: HermesProfileO
   };
 }
 
-export async function inspectHermesStatus(options: HermesProfileOptions = {}): Promise<HermesStatus> {
+export async function inspectHermesStatus(options: HermesStatusOptions = {}): Promise<HermesStatus> {
   const hermesPaths = getHermesPaths(options);
   const authStats = await statIfExists(hermesPaths.authFile);
   const authExists = Boolean(authStats?.isFile());
@@ -764,10 +1000,22 @@ export async function inspectHermesStatus(options: HermesProfileOptions = {}): P
   }
 
   const providerState = authReadable ? providerStateFromStore(store) : null;
-  const tokens = tokensFromProviderState(providerState);
+  const providerTokens = tokensFromProviderState(providerState);
   const poolEntries = authReadable ? openaiCodexPoolEntries(store) : [];
+  const poolTokens = poolEntries.map(tokensFromPoolEntry).filter((tokens): tokens is JsonObject => tokens !== null);
   const linkedAccounts = linkedAccountsFromPool(poolEntries);
+  const requestedAccount = options.account ? validateAccountName(options.account) : null;
+  const inferredAccount = requestedAccount ?? (linkedAccounts.length === 1 ? linkedAccounts[0] ?? null : null);
+  const matchingPoolEntries = inferredAccount
+    ? poolEntries.filter((entry) => accountFromCxPoolEntry(entry) === inferredAccount && tokensFromPoolEntry(entry))
+    : [];
+  const selectedPoolEntry = matchingPoolEntries[matchingPoolEntries.length - 1]
+    ?? (poolTokens.length === 1 ? poolEntries.find((entry) => tokensFromPoolEntry(entry)) : undefined);
+  const selectedPoolTokens = selectedPoolEntry ? tokensFromPoolEntry(selectedPoolEntry) : null;
+  const tokens = selectedPoolTokens
+    ?? (requestedAccount && poolEntries.length > 0 ? null : providerTokens);
   const config = await readHermesConfiguredProvider(hermesPaths.configFile);
+  const expiresAtMs = accessTokenExpiration(tokens);
 
   return {
     hermesHome: hermesPaths.home,
@@ -777,13 +1025,17 @@ export async function inspectHermesStatus(options: HermesProfileOptions = {}): P
     authExists,
     authReadable,
     authError,
-    openaiCodexAuthExists: providerState !== null,
+    openaiCodexAuthExists: providerState !== null || poolEntries.length > 0,
     hasTokens: tokens !== null,
     hasAccessToken: Boolean(tokens && stringValue(tokens.access_token)),
     hasRefreshToken: Boolean(tokens && stringValue(tokens.refresh_token)),
-    lastRefresh: typeof providerState?.last_refresh === 'string' ? providerState.last_refresh : null,
-    authMode: typeof providerState?.auth_mode === 'string' ? providerState.auth_mode : null,
-    linkedAccount: linkedAccounts[0] ?? null,
+    accessTokenExpiresAt: expiresAtMs === null ? null : new Date(expiresAtMs).toISOString(),
+    accessTokenExpired: expiresAtMs === null ? null : expiresAtMs <= Date.now(),
+    lastRefresh: stringValue(selectedPoolEntry?.last_refresh)
+      || (typeof providerState?.last_refresh === 'string' ? providerState.last_refresh : null),
+    authMode: stringValue(selectedPoolEntry?.auth_type)
+      || (typeof providerState?.auth_mode === 'string' ? providerState.auth_mode : null),
+    linkedAccount: linkedAccounts.length === 1 ? linkedAccounts[0] ?? null : null,
     linkedAccounts,
     poolEntryCount: poolEntries.length,
     configuredProvider: config.provider,

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Writable } from 'node:stream';
 import test, { type TestContext } from 'node:test';
 import {
@@ -178,6 +178,7 @@ async function makeSandbox(t: TestContext): Promise<GDriveSandbox> {
   const env = {
     ...process.env,
     CODEX_HOME: join(root, 'codex'),
+    CX_ALLOW_UNSAFE_AUTH_SYNC: '1',
     CX_GDRIVE_TOKEN_URL: server.tokenUrl,
     CX_GDRIVE_API_BASE_URL: server.baseUrl,
   };
@@ -207,6 +208,7 @@ async function runCli(args: readonly string[], env: NodeJS.ProcessEnv): Promise<
 async function writeAccount(paths: ReturnType<typeof getCodexPaths>, account: string, authJson: string): Promise<string> {
   await mkdir(paths.accountsDir, { recursive: true });
   const accountFile = accountPathForName(paths, account);
+  await mkdir(dirname(accountFile), { recursive: true });
   await writeFile(accountFile, authJson);
   return accountFile;
 }

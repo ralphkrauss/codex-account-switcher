@@ -22,6 +22,7 @@ import {
   resolveExecutable,
   useAccount,
   validateAccountName,
+  withAccountLock,
   writebackCurrentAccount,
   type CodexPaths,
 } from './accounts.js';
@@ -45,6 +46,7 @@ export const GDRIVE_BACKEND = 'gdrive';
 export const ONEPASSWORD_AUTH_FIELD = 'auth_json';
 export const REMOTE_METADATA_FIELD = 'cx_metadata';
 export const LOCAL_SYNC_METADATA_VERSION = 1;
+export const UNSAFE_LEGACY_AUTH_SYNC_ENV = 'CX_ALLOW_UNSAFE_AUTH_SYNC';
 
 export type RemoteBackend = typeof ONEPASSWORD_BACKEND | typeof GDRIVE_BACKEND;
 export type RemotePresence = 'present' | 'missing' | 'unknown';
@@ -186,6 +188,19 @@ export interface SyncStatus {
   readonly tokenFile?: string | null;
   readonly encryption?: 'none' | 'env' | null;
   readonly accounts: readonly SyncStatusAccount[];
+}
+
+function legacyAuthSyncEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env[UNSAFE_LEGACY_AUTH_SYNC_ENV] === '1';
+}
+
+function requireLegacyAuthSyncEnabled(env: NodeJS.ProcessEnv): void {
+  if (!legacyAuthSyncEnabled(env)) {
+    throw new CxError(
+      `remote auth.json push/pull is disabled because rotating Codex credentials must not be shared across devices; log in locally with 'cx login <account> --force --device-auth'. For one-time recovery only, set ${UNSAFE_LEGACY_AUTH_SYNC_ENV}=1 and ensure no other device or app is using that credential`,
+      1,
+    );
+  }
 }
 
 export interface SetupOnePasswordProfilesInput extends ConfigureOnePasswordRemoteInput {
@@ -1163,44 +1178,43 @@ async function writeLocalAccountAuthJson(
   return { account: safeAccount, accountFile, overwritten };
 }
 
-async function writeLiveAuthIfActive(account: string, authJson: string, paths: CodexPaths): Promise<void> {
-  const current = await readCurrentMarker(paths);
-  if (current.state === 'valid' && current.name === account) {
-    await writeFilePrivate(paths.authFile, authJson);
-  }
-}
-
+/** @deprecated Rotating Codex OAuth credentials must not be shared across devices. */
 export async function syncPushAccount(
   account: string,
   options: RemoteCliOptions = {},
 ): Promise<SyncPushResult> {
   const env = options.env ?? process.env;
+  requireLegacyAuthSyncEnabled(env);
   const paths = remotePaths(options);
   const config = await requireRemoteConfig({ paths });
   const safeAccount = validateRemoteSyncAccountName(account);
-  await writebackCurrentAccountIfSyncTarget(safeAccount, paths);
-  const local = await readLocalAccountAuthJson(safeAccount, paths);
-  const item = itemTitle(config, local.account);
-  const upload = isOnePasswordConfig(config)
-    ? await upsertOnePasswordAuthJson(config, item, local.account, local.authJson, env)
-    : await upsertGoogleDriveAuthJson(config, item, local.account, local.authJson, env);
-  await writeLocalSyncMetadata(paths, config, local.account, local.authJson, upload.metadata);
+  return await withAccountLock(paths, safeAccount, async () => {
+    await writebackCurrentAccountIfSyncTarget(safeAccount, paths);
+    const local = await readLocalAccountAuthJson(safeAccount, paths);
+    const item = itemTitle(config, local.account);
+    const upload = isOnePasswordConfig(config)
+      ? await upsertOnePasswordAuthJson(config, item, local.account, local.authJson, env)
+      : await upsertGoogleDriveAuthJson(config, item, local.account, local.authJson, env);
+    await writeLocalSyncMetadata(paths, config, local.account, local.authJson, upload.metadata);
 
-  return {
-    account: local.account,
-    accountFile: local.accountFile,
-    backend: config.backend,
-    vault: isOnePasswordConfig(config) ? config.vault : null,
-    item,
-    operation: upload.operation,
-  };
+    return {
+      account: local.account,
+      accountFile: local.accountFile,
+      backend: config.backend,
+      vault: isOnePasswordConfig(config) ? config.vault : null,
+      item,
+      operation: upload.operation,
+    };
+  });
 }
 
+/** @deprecated Rotating Codex OAuth credentials must not be shared across devices. */
 export async function syncPullAccount(
   account: string,
   options: RemoteForceOptions = {},
 ): Promise<SyncPullResult> {
   const env = options.env ?? process.env;
+  requireLegacyAuthSyncEnabled(env);
   const paths = remotePaths(options);
   const config = await requireRemoteConfig({ paths });
   const safeAccount = validateRemoteSyncAccountName(account);
@@ -1213,18 +1227,19 @@ export async function syncPullAccount(
     && remote.metadata.authJsonSha256 === sha256Hex(remote.authJson)
     ? remote.metadata
     : null;
-  const local = await writeLocalAccountAuthJson(safeAccount, remote.authJson, paths, options.force === true);
-  await writeLiveAuthIfActive(safeAccount, remote.authJson, paths);
-  await writeLocalSyncMetadata(paths, config, safeAccount, remote.authJson, verifiedMetadata);
+  return await withAccountLock(paths, safeAccount, async () => {
+    const local = await writeLocalAccountAuthJson(safeAccount, remote.authJson, paths, options.force === true);
+    await writeLocalSyncMetadata(paths, config, safeAccount, remote.authJson, verifiedMetadata);
 
-  return {
-    account: local.account,
-    accountFile: local.accountFile,
-    backend: config.backend,
-    vault: isOnePasswordConfig(config) ? config.vault : null,
-    item,
-    overwritten: local.overwritten,
-  };
+    return {
+      account: local.account,
+      accountFile: local.accountFile,
+      backend: config.backend,
+      vault: isOnePasswordConfig(config) ? config.vault : null,
+      item,
+      overwritten: local.overwritten,
+    };
+  });
 }
 
 export async function listRemoteAccountNames(options: RemoteCliOptions = {}): Promise<string[]> {
@@ -1236,6 +1251,7 @@ export async function listRemoteAccountNames(options: RemoteCliOptions = {}): Pr
     : await listGoogleDriveAccountNames(config, env);
 }
 
+/** @deprecated Rotating Codex OAuth credentials must not be shared across devices. */
 export async function syncPullAllAccounts(options: RemoteForceOptions = {}): Promise<SyncPullResult[]> {
   const paths = remotePaths(options);
   const accounts = await listRemoteAccountNames(options);
@@ -1250,6 +1266,7 @@ export async function syncPullAllAccounts(options: RemoteForceOptions = {}): Pro
   return results;
 }
 
+/** @deprecated Rotating Codex OAuth credentials must not be shared across devices. */
 export async function syncPushAllAccounts(options: RemoteCliOptions = {}): Promise<SyncPushResult[]> {
   const paths = remotePaths(options);
   const accounts = await listRemoteSyncAccountNames(paths);
@@ -1261,7 +1278,10 @@ export async function syncPushAllAccounts(options: RemoteCliOptions = {}): Promi
 }
 
 function autoSyncDisabled(env: NodeJS.ProcessEnv): boolean {
-  return env.CX_AUTO_SYNC === '0' || env.CX_MAGIC_SYNC === '0' || env.CX_NO_MAGIC_SYNC === '1';
+  return !legacyAuthSyncEnabled(env)
+    || env.CX_AUTO_SYNC === '0'
+    || env.CX_MAGIC_SYNC === '0'
+    || env.CX_NO_MAGIC_SYNC === '1';
 }
 
 async function readLocalAuthHash(account: string, paths: CodexPaths): Promise<string | null> {
@@ -1342,6 +1362,7 @@ async function inspectAccountSyncState(
   }
 }
 
+/** @deprecated Automatic credential sync is disabled unless explicitly enabled for recovery. */
 export async function autoPullAccountForUse(
   account: string,
   options: RemoteCliOptions = {},
@@ -1388,6 +1409,7 @@ export async function autoPullAccountForUse(
   return { action: 'skipped', account: safeAccount, item, backend: config.backend, reason: state };
 }
 
+/** @deprecated Automatic credential sync is disabled unless explicitly enabled for recovery. */
 export async function autoPushAccountIfChanged(
   account: string,
   options: RemoteCliOptions = {},
@@ -1444,6 +1466,7 @@ export async function autoPushAccountIfChanged(
   return { action: 'pushed', account: pushed.account, item: pushed.item, backend: pushed.backend, reason: state };
 }
 
+/** @deprecated Shared auth writeback and automatic credential sync are disabled. */
 export async function writebackAndAutoPushCurrentAccount(
   options: RemoteCliOptions = {},
 ): Promise<AutoSyncResult | null> {

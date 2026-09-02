@@ -1,7 +1,7 @@
 {
   "name": "@ralphkrauss/codex-account-switcher",
-  "version": "0.3.2",
-  "description": "Safe multi-account auth.json switcher for the native Codex CLI.",
+  "version": "0.4.0",
+  "description": "Safe isolated multi-profile launcher for the native Codex CLI.",
   "author": "Ralph Krauss <ralph@krauss.be>",
   "type": "module",
   "main": "dist/index.js",

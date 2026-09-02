@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.0 - 2026-09-02
+
+### Breaking changes
+
+- Replace shared `auth.json` swapping with stable per-account Codex homes under `CODEX_HOME/accounts/<name>/`. Each profile now owns its auth, config, sessions, app-server state, and refresh-token lineage.
+- Disable remote credential push/pull and automatic sync by default. Sharing rotating Codex OAuth files across devices conflicts with OpenAI's one-file-per-machine-or-serialized-stream guidance.
+- Disable `cx save`, `cx hermes use`, and `cx hermes sync` by default because they duplicate a rotating refresh token. Explicitly named unsafe environment variables remain for controlled one-time recovery only.
+
+### Added
+
+- Add `cx hermes login <account>` to run Hermes's native `auth add openai-codex` flow in a dedicated `cx-<account>` profile, creating an independent Hermes OAuth session.
+- Add `cx hermes run <account> -- ...` to launch the matching Hermes profile while also setting the matching stable Codex `CODEX_HOME` for Hermes's optional Codex app-server runtime.
+- Add full-lifetime profile locks for Codex/Hermes processes and all credential writers. Concurrent use of one profile fails closed; independently logged-in worker profiles can run in parallel.
+- Add atomic private credential writes, access-token expiry reporting in Hermes status, and profile/app-server details in `cx doctor`.
+
+### Changed
+
+- Pin every named profile to `cli_auth_credentials_store = "file"`, preventing an OS keyring entry shared outside `CODEX_HOME` from defeating profile isolation.
+- Make `cx use` update only the selected-account marker. `cx <account>`, `cx run`, `cx resume`, and no-argument `cx` launch the selected stable profile directly.
+- Automatically migrate legacy `accounts/<name>.json` slots to `accounts/<name>/auth.json` and archive the original under `accounts/.legacy-v0.3/`. A verified matching active file is preserved when it contains a newer local refresh.
+- Keep remote/backend status commands available as read-only migration diagnostics.
+
+### Fixed
+
+- Prevent shared root app-server state from silently overriding a selected account; each profile now has its own app-server control directory. `cx doctor` reports profile sockets, and login refuses to replace credentials while a profile socket exists.
+- Prevent the deprecated Hermes recovery bridge from writing another linked account's provider-level credential into the requested Codex profile. Multi-account ownership is now selected explicitly or rejected as ambiguous.
+- Prevent refresh races caused by temporary per-run auth copies, shared live-file writeback, concurrent same-profile processes, remote auto-sync, and Codex-to-Hermes token copying.
+- Preserve Windows command argument handling and existing timeout/rate-limit exit behavior under the stable-home launcher.
+
 ## 0.3.2 - 2026-07-08
 
 ### Fixed

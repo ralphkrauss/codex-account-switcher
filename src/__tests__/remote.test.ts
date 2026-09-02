@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test, { type TestContext } from 'node:test';
 import {
@@ -209,6 +209,8 @@ async function makeSandbox(t: TestContext): Promise<RemoteSandbox> {
     ...process.env,
     CODEX_HOME: codexHome,
     OP_FAKE_STORE: storeFile,
+    CX_ALLOW_UNSAFE_AUTH_SYNC: '1',
+    CX_ALLOW_UNSAFE_HERMES_TOKEN_SHARE: '1',
     PATH: [bin, process.env.PATH ?? ''].join(delimiter),
   };
   return {
@@ -251,6 +253,7 @@ function runCli(args: readonly string[], env: NodeJS.ProcessEnv) {
 async function writeAccount(paths: ReturnType<typeof getCodexPaths>, account: string, authJson: string): Promise<string> {
   await mkdir(paths.accountsDir, { recursive: true });
   const accountFile = accountPathForName(paths, account);
+  await mkdir(dirname(accountFile), { recursive: true });
   await writeFile(accountFile, authJson);
   return accountFile;
 }
@@ -343,7 +346,7 @@ test('sync push creates and edits 1Password auth_json, and pull writes local acc
   assert.equal(await readFile(accountFile, 'utf8'), secondAuth);
 });
 
-test('sync push writes back refreshed live auth for the active account before uploading', async (t) => {
+test('legacy sync push ignores unrelated shared auth and uploads the stable profile', async (t) => {
   const sandbox = await makeSandbox(t);
   await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
   const staleAuth = `${JSON.stringify({ account: 'work', token: 'stale', filler: 'x'.repeat(200) })}\n`;
@@ -355,11 +358,12 @@ test('sync push writes back refreshed live auth for the active account before up
   await syncPushAccount('work', { paths: sandbox.paths, env: sandbox.env });
 
   const store = await readStore(sandbox.storeFile);
-  assert.deepEqual(JSON.parse(storedAuthJson(store, 'Dev', 'cx-work')) as unknown, JSON.parse(refreshedAuth) as unknown);
-  assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), refreshedAuth);
+  assert.deepEqual(JSON.parse(storedAuthJson(store, 'Dev', 'cx-work')) as unknown, JSON.parse(staleAuth) as unknown);
+  assert.equal(await readFile(accountPathForName(sandbox.paths, 'work'), 'utf8'), staleAuth);
+  assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), refreshedAuth);
 });
 
-test('sync pull of the active account updates live auth to avoid stale writeback reversal', async (t) => {
+test('legacy sync pull updates the stable profile without creating shared auth', async (t) => {
   const sandbox = await makeSandbox(t);
   await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
   const freshAuth = `${JSON.stringify({ account: 'work', token: 'fresh-remote', filler: 'x'.repeat(200) })}\n`;
@@ -374,7 +378,7 @@ test('sync pull of the active account updates live auth to avoid stale writeback
 
   assert.equal(pulled.overwritten, true);
   assert.equal(await readFile(accountFile, 'utf8'), freshAuth);
-  assert.equal(await readFile(sandbox.paths.authFile, 'utf8'), freshAuth);
+  await assert.rejects(() => readFile(sandbox.paths.authFile, 'utf8'), /ENOENT/u);
 });
 
 test('sync push of an inactive account does not write back or corrupt the active slot', async (t) => {
@@ -505,7 +509,7 @@ test('CLI 1Password setup and --all sync make remote-backed profiles native on a
   assert.equal((await readFile(join(freshPaths.home, '.current-account'), 'utf8')).trim(), 'personal');
 });
 
-test('CLI Hermes use auto-pulls a missing 1Password-backed profile and only targets the requested Hermes profile', async (t) => {
+test('deprecated CLI Hermes use does not auto-pull a missing remote profile', async (t) => {
   const sandbox = await makeSandbox(t);
   await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
   const authJson = `${JSON.stringify({
@@ -527,17 +531,13 @@ test('CLI Hermes use auto-pulls a missing 1Password-backed profile and only targ
   };
   const result = runCli(['hermes', 'use', 'gi', '--profile', 'cx-smoke'], hermesEnv);
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /auto-pulled 1Password-backed profile 'gi'/u);
-  assert.match(result.stdout, /Hermes openai-codex auth now uses cx account 'gi'/u);
-  const profilePaths = getHermesPaths({ env: hermesEnv, profile: 'cx-smoke' });
-  const profileAuth = JSON.parse(await readFile(profilePaths.authFile, 'utf8')) as Record<string, any>;
-  assert.equal(profileAuth.providers['openai-codex'].tokens.access_token, 'remote-hermes-access');
-  assert.equal(await readFile(accountFile, 'utf8'), authJson);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /no account 'gi'/u);
+  await assert.rejects(() => readFile(accountFile, 'utf8'), /ENOENT/u);
   await assert.rejects(() => readFile(join(hermesEnv.HERMES_HOME ?? '', 'auth.json'), 'utf8'), /ENOENT/u);
 });
 
-test('CLI Hermes sync auto-pushes refreshed profile tokens back to 1Password', async (t) => {
+test('deprecated CLI Hermes sync never auto-pushes refreshed tokens to 1Password', async (t) => {
   const sandbox = await makeSandbox(t);
   await configureOnePasswordRemote({ vault: 'Dev', itemPrefix: 'cx-' }, { paths: sandbox.paths });
   await writeAccount(sandbox.paths, 'gi', `${JSON.stringify({
@@ -569,13 +569,13 @@ test('CLI Hermes sync auto-pushes refreshed profile tokens back to 1Password', a
   const synced = runCli(['hermes', 'sync', 'gi', '--profile', 'cx-smoke'], hermesEnv);
   assert.equal(synced.status, 0, synced.stderr);
   assert.match(synced.stdout, /synced Hermes openai-codex tokens to cx account 'gi'/u);
-  assert.match(synced.stdout, /auto-pushed profile 'gi'/u);
+  assert.doesNotMatch(synced.stdout, /auto-pushed profile 'gi'/u);
 
   const localAccount = JSON.parse(await readFile(accountPathForName(sandbox.paths, 'gi'), 'utf8')) as Record<string, any>;
   assert.equal(localAccount.tokens.access_token, 'refreshed-access');
   const remoteAccount = JSON.parse(storedAuthJson(await readStore(sandbox.storeFile), 'Dev', 'cx-gi')) as Record<string, any>;
-  assert.equal(remoteAccount.tokens.access_token, 'refreshed-access');
-  assert.equal(remoteAccount.tokens.extra_token_field, 'preserved-by-hermes');
+  assert.equal(remoteAccount.tokens.access_token, 'old-access');
+  assert.equal(remoteAccount.tokens.extra_token_field, undefined);
 });
 
 test('CLI remote and sync status do not print auth JSON contents', async (t) => {

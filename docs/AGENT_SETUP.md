@@ -1,347 +1,196 @@
-# Agent setup guide for Codex account profiles
+# Agent setup guide for safe Codex profiles
 
-This guide is written so Ralph can ask an agent on a new personal device to install and configure `cx` without handing the agent raw Codex tokens.
+This guide is written so an agent can install and configure `cx` on a new device without handling raw OAuth credentials.
 
-`cx` is the `@ralphkrauss/codex-account-switcher` CLI. It stores local Codex profile slots under Codex's normal data directory and can sync named profiles through 1Password using the 1Password CLI (`op`).
-
-## Copy-paste prompt for an agent
-
-Use this prompt on a new device:
+## Copy-paste prompt
 
 ```text
-Set up Codex account switching on this machine using @ralphkrauss/codex-account-switcher.
+Set up Codex account profiles on this machine using @ralphkrauss/codex-account-switcher.
 
-Rules:
-- Do not ask me to paste Codex auth JSON, OAuth tokens, refresh tokens, or 1Password secrets into chat.
-- Do not print ~/.codex/auth.json, ~/.codex/accounts/*.json, or 1Password field contents.
-- It is OK to ask me to complete browser/device-login prompts or run a local 1Password unlock/sign-in step.
-- Prefer using 1Password-backed profiles with `cx 1password setup`.
+Safety rules:
+- Never ask me to paste or print auth.json, access tokens, refresh tokens, ID tokens, or credential-manager contents.
+- Do not copy a Codex or Hermes credential from another device or another profile.
+- It is okay to ask me to complete a browser or device-code sign-in locally.
+- Use the same friendly profile names I use elsewhere, but create new local login sessions.
 
 Tasks:
-1. Check whether Node.js 22+, npm, Codex CLI, cx, and 1Password CLI (`op`) are installed.
-2. Install or upgrade what is missing:
-   - Codex CLI: `npm install -g @openai/codex`
-   - cx: `npm install -g @ralphkrauss/codex-account-switcher`
-3. Make sure `op` is signed in/unlocked. If not, tell me the exact local command to run, such as `op signin`.
-4. Configure 1Password-backed Codex profiles:
-   `cx 1password setup --vault <VAULT_NAME> --pull --use <PROFILE_NAME>`
-5. Verify setup with safe commands only:
-   - `cx doctor`
-   - `cx 1password status`
-   - `cx ls`
-   - `cx run <PROFILE_NAME> -- --version`
-6. If a requested profile exists in 1Password but is not local, rely on `cx use <PROFILE_NAME>`, `cx run <PROFILE_NAME> -- ...`, or `cx hermes use <PROFILE_NAME> --profile <HERMES_PROFILE>` to auto-pull it.
-7. For Hermes integration, use a second Hermes profile first: `cx hermes use <PROFILE_NAME> --profile cx-smoke`, then run `hermes --profile cx-smoke ...`. If Hermes refreshes tokens, run `cx hermes sync <PROFILE_NAME> --profile cx-smoke`; with 1Password configured this also pushes the refreshed slot.
-8. If a profile's Codex session has ended, run `cx login <PROFILE_NAME> --force --device-auth`, ask me to complete the browser/device flow, then verify with `cx sync status <PROFILE_NAME>`. The refreshed profile auto-pushes when remote sync is configured.
-
-Use `<VAULT_NAME>` for the 1Password vault that contains the `cx-*` items and `<PROFILE_NAME>` for the profile I want active, for example `gi` or `personal`.
+1. Check Node.js 22+, npm, the Codex CLI, cx, and (if requested) Hermes.
+2. Install or upgrade Codex and cx:
+   npm install -g @openai/codex @ralphkrauss/codex-account-switcher
+3. For every requested Codex profile, run:
+   cx login <PROFILE_NAME> --device-auth
+   Ask me to complete the local sign-in as the intended account.
+4. Verify safely:
+   cx ls
+   cx doctor
+   cx run <PROFILE_NAME> -- --version
+5. If Hermes is requested, create its independent login:
+   cx hermes login <PROFILE_NAME>
+   cx hermes status <PROFILE_NAME>
+6. Do not enable CX_ALLOW_UNSAFE_PROFILE_IMPORT,
+   CX_ALLOW_UNSAFE_AUTH_SYNC, or CX_ALLOW_UNSAFE_HERMES_TOKEN_SHARE.
+7. Report profile names and safe status fields only. Never report token values.
 ```
 
-## What the setup should produce
-
-After setup, these files may exist:
+## Expected layout
 
 ```text
-~/.codex/auth.json                  # Codex's active/live auth file
-~/.codex/accounts/<profile>.json    # local named profile copies
-~/.codex/.current-account           # active profile marker
-~/.codex/remote.json                # 1Password sync config
+~/.codex/accounts/<profile>/auth.json
+~/.codex/accounts/<profile>/config.toml
+~/.codex/accounts/<profile>/sessions/
+~/.codex/.current-account
+
+~/.hermes/profiles/cx-<profile>/auth.json       # if Hermes is configured
 ```
 
-The package code itself is installed by npm. Credential data stays under `~/.codex` and, if enabled, in 1Password secure-note items.
+Every Codex profile is a stable `CODEX_HOME`, and every Hermes profile owns a separate OAuth session. The same profile name on two devices does not mean the credential file is shared.
 
-## New personal device: normal interactive flow
+## Interactive setup
 
-1. Install prerequisites.
+Install prerequisites:
 
-   macOS with Homebrew:
+```bash
+npm install -g @openai/codex @ralphkrauss/codex-account-switcher
+node --version
+codex --version
+cx --version
+```
 
-   ```bash
-   brew install node@22 1password-cli
-   npm install -g @openai/codex @ralphkrauss/codex-account-switcher
-   ```
+Create profiles:
 
-   Windows with PowerShell/winget:
+```bash
+cx login personal --device-auth
+cx login gi --device-auth
+cx login beta --device-auth
+```
 
-   ```powershell
-   winget install OpenJS.NodeJS.LTS
-   winget install AgileBits.1Password.CLI
-   npm install -g @openai/codex @ralphkrauss/codex-account-switcher
-   ```
-
-   Linux example:
-
-   ```bash
-   node --version   # must be v22+
-   npm install -g @openai/codex @ralphkrauss/codex-account-switcher
-   ```
-
-2. Sign in to 1Password CLI locally.
-
-   ```bash
-   op signin
-   op vault list
-   ```
-
-3. Configure and pull the remote profiles.
-
-   ```bash
-   cx 1password setup --vault <VAULT_NAME> --pull --use <PROFILE_NAME>
-   ```
-
-   Example:
-
-   ```bash
-   cx 1password setup --vault Codex --pull --use gi
-   ```
-
-4. Verify without exposing secrets.
-
-   ```bash
-   cx doctor
-   cx 1password status
-   cx ls
-   cx run gi -- --version
-   ```
-
-5. Switch naturally after that.
-
-   ```bash
-   cx use gi
-   cx use personal
-   cx run gi -- exec "summarize this repo"
-   cx resume --last
-   cx resume <session-id>
-   ```
-
-## First machine / bootstrapping profiles into 1Password
-
-If 1Password does not have any `cx-*` items yet, bootstrap from a machine where Codex is already logged in.
-
-1. Save or create named local profiles.
-
-   If the current `~/.codex/auth.json` is the account you want to call `gi`:
-
-   ```bash
-   cx save gi
-   ```
-
-   If you need to log in a new account:
-
-   ```bash
-   cx login personal --force --device-auth
-   ```
-
-2. Configure the vault.
-
-   ```bash
-   cx 1password setup --vault <VAULT_NAME>
-   ```
-
-3. Push named profiles if needed. With remote sync configured, `cx save <profile>` and `cx login <profile>` auto-push safely; explicit sync remains available for bootstrapping or repair.
-
-   ```bash
-   cx sync push gi
-   cx sync push personal
-   # or push all local named profiles except reserved default:
-   cx sync push --all
-   ```
-
-4. Confirm presence only, not token contents.
-
-   ```bash
-   cx sync status
-   ```
-
-## Headless hosts and EC2
-
-For a non-interactive Linux host, prefer a 1Password service account scoped only to the dedicated Codex vault.
-
-1. Create a 1Password service account with access only to the Codex profile vault.
-2. Store the token in a local env file with private permissions. Do this outside chat; do not paste the token to the agent.
-
-   ```bash
-   mkdir -p ~/.config/1password
-   install -m 600 /dev/null ~/.config/1password/op.env
-   $EDITOR ~/.config/1password/op.env
-   ```
-
-   File contents:
-
-   ```bash
-   export OP_SERVICE_ACCOUNT_TOKEN="..."
-   ```
-
-3. Source it before running `cx` commands.
-
-   ```bash
-   set -a
-   . ~/.config/1password/op.env
-   set +a
-   op vault list
-   cx 1password setup --vault <VAULT_NAME> --pull --use <PROFILE_NAME>
-   ```
-
-If the shell is non-interactive, make sure the env file is sourced before any early `return` in shell startup files, or source it explicitly in the command that runs the agent.
-
-## Day-to-day commands
-
-List local profiles:
+Verify:
 
 ```bash
 cx ls
+cx doctor
+cx run personal -- --version
+cx run gi -- --version
+cx run beta -- --version
 ```
 
-Switch active profile:
+Use them:
 
 ```bash
-cx use gi
+cx personal
+cx run gi -- exec "review this repository"
+cx use beta
+cx resume --last
 ```
 
-Run Codex under a profile:
+## Hermes setup
+
+Hermes must authenticate independently. Do not seed it from the Codex `auth.json`.
 
 ```bash
-cx run gi -- exec "fix the failing tests"
+cx hermes login personal
+cx hermes login gi
+cx hermes login beta
+
+cx hermes status personal
+cx hermes run personal -- chat
 ```
 
-Login or refresh a profile. With 1Password sync configured, `cx login` saves the refreshed credentials and auto-pushes them to the remote backend:
+The default mapping is `personal` to Hermes profile `cx-personal`. When `cx hermes run personal` starts Hermes, it also sets `CODEX_HOME` to `~/.codex/accounts/personal`. This keeps Hermes's optional Codex app-server runtime aligned with the requested account while Hermes's direct provider continues using its independent OAuth session.
+
+If Hermes reports a missing provider token after a successful native login, upgrade Hermes and consult [Hermes issue #32730](https://github.com/NousResearch/hermes-agent/issues/32730). Do not fix the upstream pool/provider split by importing Codex credentials.
+
+## Headless hosts
+
+Prefer device-code login on the target host:
 
 ```bash
-cx login personal --force --device-auth
-cx sync status personal
+cx login worker --device-auth
 ```
 
-Pull a new remote profile:
+Open the displayed link on a trusted browser, sign in as the requested account, and enter the one-time code. If device login is unavailable, use SSH callback forwarding as described in the [Codex authentication guide](https://developers.openai.com/codex/auth/).
+
+For CI/CD, API keys are the recommended default. If ChatGPT-managed authentication is required, follow OpenAI's [advanced CI/CD guidance](https://learn.chatgpt.com/docs/auth/ci-cd-auth): one persistent `auth.json` per runner or serialized workflow stream, with the refreshed file preserved between runs. Never use one credential concurrently on multiple machines.
+
+## Concurrent workers
+
+One profile permits one writer. `cx` blocks a second Codex or Hermes process that could mutate the same profile.
+
+For parallel jobs, create independently authenticated workers:
 
 ```bash
-cx sync pull personal
+cx login gi-worker-1 --device-auth
+cx login gi-worker-2 --device-auth
+
+cx run gi-worker-1 --timeout 1800 -- exec "task one"
+cx run gi-worker-2 --timeout 1800 -- exec "task two"
 ```
 
-Pull every missing remote profile:
+Never create workers by copying an existing `auth.json`.
+
+## Upgrade from cx 0.3
+
+1. Stop Codex, Hermes, and Codex app-server processes.
+2. Upgrade cx.
+3. Trigger and inspect local migration.
 
 ```bash
-cx sync pull --all
+npm install -g @ralphkrauss/codex-account-switcher@latest
+cx ls
+cx doctor
 ```
 
-Show local/remote presence without secrets:
+Legacy `~/.codex/accounts/<name>.json` files move into `~/.codex/accounts/<name>/auth.json`, with originals archived under `.legacy-v0.3`.
+
+Do not continue the old 1Password/Google Drive pull workflow on another device. Log in each profile locally instead. Recreate Hermes credentials with `cx hermes login <name>`.
+
+## Recovery
+
+If a profile reports `refresh_token_reused`, `refresh_token_invalidated`, a revoked token, or repeated 401 responses:
+
+1. Stop all processes using that profile.
+2. Check for an app-server process/socket with `cx doctor`.
+3. Reauthenticate only the affected local profile.
 
 ```bash
-cx 1password status
-cx sync status
+cx login <PROFILE_NAME> --force --device-auth
 ```
 
-## Important rules
-
-- Sync named profiles such as `gi` and `personal`; do not sync `default`.
-- `default` is reserved for Codex's live `auth.json` target on each machine.
-- `cx use <profile>` chooses which named profile is active on that machine.
-- Do not copy `auth.json` through chat, git, shared folders, or plain text notes.
-- Do not run a fresh `cx login <profile>` on a secondary machine unless you intentionally want to rotate/replace that OAuth session. Pulling from 1Password is safer for shared profiles.
-- If Codex says a session has ended, run `cx login <profile> --force --device-auth`; with remote sync configured, `cx` auto-pushes the refreshed profile. Confirm with `cx sync status <profile>`.
-- If local and remote both changed, `cx` reports a sync conflict and refuses to overwrite either side. Resolve deliberately with explicit `cx sync pull <profile> --force` or `cx sync push <profile>`.
-- To temporarily disable magic sync for debugging, set `CX_AUTO_SYNC=0`; explicit `cx sync ...` commands still work.
-
-## Troubleshooting
-
-### `cx: command not found`
-
-Check npm's global bin directory:
+If login reports an app-server socket, stop its process before removing the socket:
 
 ```bash
-npm bin -g
-npm prefix -g
+ps aux | grep '[c]odex app-server'
+kill <PID>
+rm -f ~/.codex/accounts/<PROFILE_NAME>/app-server-control/app-server-control.sock
 ```
 
-Make sure the global bin directory is on `PATH`, then reinstall:
+Then retry the login. Do not restore an older remote copy afterward.
 
-```bash
-npm install -g @ralphkrauss/codex-account-switcher
-```
+## Deprecated features
 
-### Node is too old
+The following credential-copy paths are disabled by default in cx 0.4:
 
-`cx` requires Node.js 22+:
+- `cx save`
+- `cx sync push` and `cx sync pull`
+- automatic remote credential sync
+- `cx hermes use` and `cx hermes sync`
 
-```bash
-node --version
-```
+Existing backend/status commands remain useful for auditing old installations. The unsafe override environment variables are intentionally excluded from normal setup; they are for controlled one-time recovery only.
 
-Upgrade Node, then reinstall the global packages.
+## Safe reporting
 
-### `op` cannot access the vault
+Agents may report:
 
-Verify the CLI can see the vault:
+- installed versions;
+- profile names;
+- paths to profile homes;
+- whether credential/config files exist;
+- file sizes and permission modes;
+- `cx doctor`, `cx ls`, limits, sync presence, and Hermes status fields.
 
-```bash
-op vault list
-op item list --vault <VAULT_NAME>
-```
+Agents must not report:
 
-If that fails, sign in/unlock 1Password locally or fix the service-account token/vault permissions.
-
-### Remote profile is shown but not local
-
-Use either:
-
-```bash
-cx sync pull <PROFILE_NAME>
-```
-
-or just switch/run it; `cx` will auto-pull from the configured 1Password backend:
-
-```bash
-cx use <PROFILE_NAME>
-cx run <PROFILE_NAME> -- --version
-```
-
-### Local profile exists but should be replaced by 1Password
-
-Use force deliberately:
-
-```bash
-cx sync pull <PROFILE_NAME> --force
-```
-
-### I ran raw `codex login` while another profile was active
-
-If the live `~/.codex/auth.json` is now the refreshed profile but `cx ls` still marks a different profile active, first save the live auth into the intended profile slot:
-
-```bash
-cx save <PROFILE_NAME> --force
-cx sync status <PROFILE_NAME>
-```
-
-`cx save` auto-pushes when remote sync is configured. If you disabled auto-sync, run `cx sync push <PROFILE_NAME>` manually.
-
-Example:
-
-```bash
-cx save personal --force
-cx sync status personal
-```
-
-Then restore/switch any other profile from 1Password if needed:
-
-```bash
-cx sync pull gi --force
-cx use gi
-```
-
-### Need to migrate from the old shell script
-
-Keep credential data, remove only the sourced script/hook:
-
-```bash
-npm install -g @ralphkrauss/codex-account-switcher
-rm -f ~/.codex/codex-acct.sh
-```
-
-Then remove the marked `.bashrc` block that sourced `~/.codex/codex-acct.sh`.
-
-Do not delete:
-
-```text
-~/.codex/auth.json
-~/.codex/accounts/
-~/.codex/.current-account
-```
+- any token value or token fragment;
+- raw `auth.json` or Hermes credential-store contents;
+- concealed 1Password values;
+- Google OAuth secrets or encryption keys.

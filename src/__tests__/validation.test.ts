@@ -43,8 +43,8 @@ test('accountPathForName stays inside accounts for valid names', async (t) => {
   const paths = getCodexPaths({ CODEX_HOME: home });
 
   const accountPath = accountPathForName(paths, 'prod.v1-a_b');
-  assert.equal(dirname(accountPath), paths.accountsDir);
-  assert.equal(accountPath, join(paths.accountsDir, 'prod.v1-a_b.json'));
+  assert.equal(dirname(accountPath), join(paths.accountsDir, 'prod.v1-a_b'));
+  assert.equal(accountPath, join(paths.accountsDir, 'prod.v1-a_b', 'auth.json'));
 });
 
 test('path traversal names never write outside accounts', async (t) => {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Writable } from 'node:stream';
 import test, { type TestContext } from 'node:test';
 import {
@@ -105,7 +105,9 @@ async function makeSandbox(t: TestContext): Promise<{ env: NodeJS.ProcessEnv; pa
 
 async function writeAccount(paths: ReturnType<typeof getCodexPaths>, account: string, auth: Record<string, unknown>): Promise<void> {
   await mkdir(paths.accountsDir, { recursive: true });
-  await writeFile(accountPathForName(paths, account), `${JSON.stringify(auth, null, 2)}\n`);
+  const accountFile = accountPathForName(paths, account);
+  await mkdir(dirname(accountFile), { recursive: true });
+  await writeFile(accountFile, `${JSON.stringify(auth, null, 2)}\n`);
 }
 
 class CaptureStream extends Writable {
