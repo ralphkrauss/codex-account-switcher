@@ -98,6 +98,8 @@ cx hermes run personal -- chat
 
 The default mapping is `personal` to Hermes profile `cx-personal`. When `cx hermes run personal` starts Hermes, it also sets `CODEX_HOME` to `~/.codex/accounts/personal`. This keeps Hermes's optional Codex app-server runtime aligned with the requested account while Hermes's direct provider continues using its independent OAuth session.
 
+If the account should use Hermes's existing canonical root profile at `~/.hermes`, pass `--profile default` consistently to login, status, and run. Hermes reserves `default` for that root; named profiles use `~/.hermes/profiles/<name>`.
+
 If Hermes reports a missing provider token after a successful native login, upgrade Hermes and consult [Hermes issue #32730](https://github.com/NousResearch/hermes-agent/issues/32730). Do not fix the upstream pool/provider split by importing Codex credentials.
 
 ## Headless hosts

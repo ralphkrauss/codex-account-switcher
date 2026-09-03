@@ -138,6 +138,14 @@ By default, account `gi` maps to Hermes profile `cx-gi`. `cx hermes login gi` ru
 hermes --profile cx-gi auth add openai-codex
 ```
 
+Hermes reserves the profile ID `default` for its canonical root home at `~/.hermes`; it is not a named profile under `~/.hermes/profiles/`. To use an existing primary/default Hermes installation, pass it explicitly:
+
+```bash
+cx hermes login gi --profile default
+cx hermes status gi --profile default
+cx hermes run gi --profile default -- chat
+```
+
 Complete that login as the same ChatGPT account/workspace used by the cx profile. When token claims expose an account ID, `cx` rejects a detected mismatch.
 
 `cx hermes run gi` supplies both:

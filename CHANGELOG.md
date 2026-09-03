@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 - 2026-09-03
+
+### Fixed
+
+- Resolve the explicit Hermes profile `default` to the canonical root `~/.hermes` home instead of the nonexistent named-profile path `~/.hermes/profiles/default`. Native Hermes login, status, and run preflight now inspect the same root auth/config files that Hermes uses.
+- Canonicalize case variants such as `Default` to Hermes's internal `default` profile ID.
+
 ## 0.4.0 - 2026-09-02
 
 ### Breaking changes

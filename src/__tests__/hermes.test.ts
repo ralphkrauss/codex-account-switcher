@@ -83,7 +83,9 @@ if (process.env.HERMES_CODEX_HOME_FILE) writeFileSync(process.env.HERMES_CODEX_H
 const profileIndex = args.indexOf('--profile');
 const profile = args[profileIndex + 1];
 if (args.includes('auth') && args.includes('add')) {
-  const profileHome = join(process.env.HOME, '.hermes', 'profiles', profile);
+  const profileHome = profile === 'default'
+    ? join(process.env.HOME, '.hermes')
+    : join(process.env.HOME, '.hermes', 'profiles', profile);
   const label = args[args.indexOf('--label') + 1];
   mkdirSync(profileHome, { recursive: true });
   writeFileSync(join(profileHome, 'auth.json'), JSON.stringify({
@@ -336,6 +338,65 @@ test('native Hermes login and run use an independent account-scoped profile', as
   (((expiredAuth.credential_pool as Record<string, any>)['openai-codex'] as Record<string, unknown>[])[0] as Record<string, unknown>).access_token = fakeJwt({ exp: 1 });
   await writeFile(login.authFile, `${JSON.stringify(expiredAuth, null, 2)}\n`);
   assert.equal((await inspectHermesStatus({ env, profile: 'cx-gi' })).accessTokenExpired, true);
+});
+
+test('explicit Hermes default profile uses the canonical root home for login, status, and run', async (t) => {
+  const sandbox = await makeSandbox(t);
+  const fakeHermes = join(sandbox.root, process.platform === 'win32' ? 'hermes-default.cmd' : 'hermes-default');
+  const argsFile = join(sandbox.root, 'hermes-default-args.txt');
+  const codexHomeFile = join(sandbox.root, 'hermes-default-codex-home.txt');
+  const defaultHome = join(sandbox.root, '.hermes');
+  const accessToken = fakeJwt({
+    exp: Math.floor(Date.now() / 1000) + 3_600,
+    'https://api.openai.com/auth': { chatgpt_account_id: 'acct-beta' },
+  });
+  await writeCodexAccount(sandbox.env, 'beta', {
+    access_token: fakeJwt({ exp: 1, 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-beta' } }),
+    refresh_token: 'codex-beta-refresh',
+    account_id: 'acct-beta',
+  });
+  await writeFakeHermes(fakeHermes);
+  const env = {
+    ...sandbox.env,
+    HERMES_ARGS_FILE: argsFile,
+    HERMES_ACCESS_TOKEN: accessToken,
+    HERMES_CODEX_HOME_FILE: codexHomeFile,
+  };
+
+  const paths = getHermesPaths({ env, profile: 'default' });
+  assert.equal(paths.home, defaultHome);
+  assert.equal(paths.authFile, join(defaultHome, 'auth.json'));
+  assert.equal(paths.configFile, join(defaultHome, 'config.yaml'));
+  assert.equal(paths.profile, 'default');
+  assert.deepEqual(getHermesPaths({ env, profile: 'Default' }), paths);
+
+  const login = await loginHermesAccount('beta', {
+    env,
+    profile: 'default',
+    command: fakeHermes,
+    stdin: 'ignore',
+  });
+  assert.equal(login.profile, 'default');
+  assert.equal(login.hermesHome, defaultHome);
+  assert.equal(await exists(join(defaultHome, 'auth.json')), true);
+  assert.equal(await exists(join(defaultHome, 'profiles', 'default', 'auth.json')), false);
+
+  const status = await inspectHermesStatus({ env, profile: 'default', account: 'beta' });
+  assert.equal(status.hermesHome, defaultHome);
+  assert.equal(status.profile, 'default');
+  assert.equal(status.hasAccessToken, true);
+  assert.equal(status.hasRefreshToken, true);
+  assert.equal(status.linkedAccount, 'beta');
+
+  const exitCode = await runHermesAccount('beta', ['chat'], {
+    env,
+    profile: 'default',
+    command: fakeHermes,
+    stdin: 'ignore',
+  });
+  assert.equal(exitCode, 0);
+  assert.equal(await readFile(argsFile, 'utf8'), '--profile\ndefault\nchat\n');
+  assert.equal((await readFile(codexHomeFile, 'utf8')).trim(), join(sandbox.codexHome, 'accounts', 'beta'));
 });
 
 test('legacy Hermes token copying is disabled unless explicitly enabled for recovery', async (t) => {

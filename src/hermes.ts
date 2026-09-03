@@ -257,7 +257,8 @@ function userHomeFromEnv(env: NodeJS.ProcessEnv): string {
 
 function validateHermesProfileName(name: string): string {
   try {
-    return validateAccountName(name);
+    const validated = validateAccountName(name);
+    return validated.toLowerCase() === 'default' ? 'default' : validated;
   } catch (error) {
     if (error instanceof CxError) {
       throw new CxError(error.message.replace('account name', 'Hermes profile name'), error.exitCode);
@@ -282,7 +283,9 @@ export function getHermesPaths(options: HermesProfileOptions = {}): HermesPaths 
       throw new CxError('Hermes profile name cannot be empty', 2);
     }
     profile = validateHermesProfileName(trimmedProfile);
-    home = join(userHomeFromEnv(env), '.hermes', 'profiles', profile);
+    home = profile === 'default'
+      ? join(userHomeFromEnv(env), '.hermes')
+      : join(userHomeFromEnv(env), '.hermes', 'profiles', profile);
   } else {
     const configured = env.HERMES_HOME;
     home = configured && configured.trim().length > 0

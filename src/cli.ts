@@ -204,7 +204,8 @@ Commands:
 
 Paths:
   By default account <name> maps to Hermes profile cx-<name>.
-  --profile <name> explicitly targets ~/.hermes/profiles/<name>.`;
+  --profile <name> explicitly targets ~/.hermes/profiles/<name>.
+  --profile default targets Hermes' canonical root home at ~/.hermes.`;
 }
 
 function remoteHelpText(): string {
